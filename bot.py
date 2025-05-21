@@ -22,7 +22,7 @@ SCRAPE_INTERVAL   = 180  # Scrape every hour (in seconds)
 POST_INTERVAL     = random.randint(60, 180)  # Post every 10-15 minutes (in seconds)
 BASE_REDIRECT_URL = 'https://udemyfreecoupons2080.blogspot.com'
 PORT              = 10000  # health-check endpoint port
-MAX_PAGES         = 3  # Number of pages to scrape from discudemy
+MAX_PAGES         = 1  # Number of pages to scrape from discudemy
 # ────────────────────────────────────────────────────────────
 
 # List of user agents to rotate through

@@ -168,7 +168,7 @@ class DiscUdemyScraper:
             "coupon_code": code
         }
 
-    def scrape(self, max_pages=5, delay_range=(1,3)):
+    def scrape(self, max_pages=1, delay_range=(1,3)):
         results = []
         try:
             for p in range(1, max_pages+1):
