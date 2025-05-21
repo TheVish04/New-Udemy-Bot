@@ -18,11 +18,12 @@ from discudemy_scraper import DiscUdemyScraper
 # ─── CONFIG ────────────────────────────────────────────────
 TOKEN             = '7918306173:AAFFIedi9d4R8XDA0AlsOin8BCfJRJeNGWE'
 CHAT_ID           = '@udemyfreecourses2080'
-SCRAPE_INTERVAL   = 180  # Scrape every hour (in seconds)
-POST_INTERVAL     = random.randint(60, 180)  # Post every 10-15 minutes (in seconds)
+SCRAPE_INTERVAL   = 3600  # Scrape every hour (in seconds)
+POST_INTERVAL     = random.randint(600, 900)  # Post every 10-15 minutes (in seconds)
 BASE_REDIRECT_URL = 'https://udemyfreecoupons2080.blogspot.com'
 PORT              = 10000  # health-check endpoint port
 MAX_PAGES         = 1  # Number of pages to scrape from discudemy
+MAX_RETRY_ATTEMPTS = 3  # Number of times to retry scraping if it fails
 # ────────────────────────────────────────────────────────────
 
 # List of user agents to rotate through
@@ -95,43 +96,53 @@ def run_health_server():
 
 # ─── DISCUDEMY SCRAPER ───────────────────────────────────
 def scrape_discudemy():
-    """Scrape DiscUdemy for fresh coupons and update the database"""
-    try:
-        logger.info(f"Starting DiscUdemy scraper for {MAX_PAGES} pages")
-        
-        scraper = DiscUdemyScraper(headless=True)
+    """Scrape DiscUdemy for fresh coupons and update the database with retry mechanism"""
+    retry_count = 0
+    while retry_count < MAX_RETRY_ATTEMPTS:
         try:
-            results = scraper.scrape(max_pages=MAX_PAGES)
+            logger.info(f"Starting DiscUdemy scraper for {MAX_PAGES} pages (attempt {retry_count + 1}/{MAX_RETRY_ATTEMPTS})")
             
-            if not results:
-                logger.warning("No coupons found during scraping")
-                return
+            scraper = DiscUdemyScraper(headless=True)
+            try:
+                results = scraper.scrape(max_pages=MAX_PAGES)
                 
-            # Convert to list of (slug, coupon_code) tuples
-            coupons = [(item['slug'], item['coupon_code']) for item in results 
-                       if item['slug'] and item['coupon_code']]
+                if not results:
+                    logger.warning("No coupons found during scraping")
+                    retry_count += 1
+                    time.sleep(60)  # Wait a minute before retrying
+                    continue
+                    
+                # Convert to list of (slug, coupon_code) tuples
+                coupons = [(item['slug'], item['coupon_code']) for item in results 
+                           if item['slug'] and item['coupon_code']]
+                    
+                logger.info(f"Successfully scraped {len(coupons)} valid coupons")
                 
-            logger.info(f"Successfully scraped {len(coupons)} valid coupons")
-            
-            # Update our database
-            coupon_db.update_coupons(coupons)
-            
+                # Update our database
+                coupon_db.update_coupons(coupons)
+                return  # Success - exit the retry loop
+                
+            except Exception as e:
+                logger.error(f"Error during scraping attempt {retry_count + 1}: {e}", exc_info=True)
+                retry_count += 1
+                time.sleep(60)  # Wait before retry
+            finally:
+                try:
+                    scraper.close()
+                except:
+                    pass
+                
         except Exception as e:
-            logger.error(f"Error during scraping: {e}", exc_info=True)
-        finally:
-            scraper.close()
-            
-    except Exception as e:
-        logger.error(f"Failed to initialize scraper: {e}", exc_info=True)
+            logger.error(f"Failed to initialize scraper (attempt {retry_count + 1}): {e}", exc_info=True)
+            retry_count += 1
+            time.sleep(60)  # Wait before retry
+    
+    logger.error(f"All {MAX_RETRY_ATTEMPTS} scraping attempts failed")
 
 # ─── UDEMY SCRAPER ─────────────────────────────────────────
 def fetch_course_details(slug):
     """
-    Scrape Udemy course page for:
-      - title
-      - thumbnail (og:image)
-      - description (og:description)
-    And generate random rating and students instead of fetching them.
+    Scrape Udemy course page with improved error handling
     """
     url = f"https://www.udemy.com/course/{slug}/"
     
@@ -153,10 +164,23 @@ def fetch_course_details(slug):
     # Add a delay to avoid being rate-limited (random between 1-3 seconds)
     time.sleep(random.uniform(1, 3))
     
+    session = requests.Session()
+    
     try:
-        # Try to get the course page
-        resp = requests.get(url, headers=headers, timeout=15)
-        resp.raise_for_status()
+        # Try to get the course page with timeout and retries
+        retries = 3
+        for attempt in range(retries):
+            try:
+                resp = session.get(url, headers=headers, timeout=15)
+                resp.raise_for_status()
+                break
+            except (requests.RequestException, Exception) as e:
+                if attempt < retries - 1:
+                    logger.warning(f"Request failed (attempt {attempt+1}/{retries}): {e}")
+                    time.sleep(2)
+                    continue
+                raise
+                
         soup = BeautifulSoup(resp.text, 'html.parser')
 
         # Extract Open Graph metadata
@@ -181,6 +205,9 @@ def fetch_course_details(slug):
         thumbnail = None
         description = 'Check out this course for exciting content!'
 
+    # Close the session
+    session.close()
+
     # Generate random rating and students
     rating = round(random.uniform(4.0, 5.0), 1)  # Higher ratings look better
     students = random.randint(5000, 100000)      # More students look better
@@ -189,98 +216,115 @@ def fetch_course_details(slug):
 
 # ─── TELEGRAM SENDER ───────────────────────────────────────
 def send_coupon():
-    try:
-        # Get the next coupon
-        slug, coupon = coupon_db.get_next_coupon()
-        
-        # Create redirect URL
-        redirect_url = f"{BASE_REDIRECT_URL}?udemy_url=" + urllib.parse.quote(
-            f"https://www.udemy.com/course/{slug}/?couponCode={coupon}", safe=''
-        )
-
-        # Get course details with retry mechanism
-        retries = 3
-        title, img, desc, rating, students = None, None, None, None, None
-        
-        while retries > 0:
-            try:
-                title, img, desc, rating, students = fetch_course_details(slug)
-                break
-            except Exception as e:
-                logger.warning(f"Error fetching course details (attempt {4-retries}/3): {str(e)}")
-                retries -= 1
-                time.sleep(2)  # Wait 2 seconds before retry
-        
-        # If all retries failed, use fallback values
-        if not title:
-            title = slug.replace('-', ' ').title()
-            img = None
-            desc = 'Check out this course for exciting content!'
-            rating = round(random.uniform(3.5, 5.0), 1)
-            students = random.randint(5000, 100000)
-
-        # Generate a random number for enrolls left (between 1 and 1000)
-        enrolls_left = random.randint(1, 1000)
-
-        # Format the description to a maximum of 200 characters with ellipsis
-        short_desc = (desc[:197] + '...') if len(desc) > 200 else desc
-
-        # Build HTML caption with structured format
-        rating_text = f"{rating:.1f}/5"
-        students_text = f"{students:,}"
-        enrolls_left_text = f"{enrolls_left:,}"
-
-        # Clean up title to prevent HTML parsing issues
-        title = title.replace("<", "&lt;").replace(">", "&gt;")
-        
-        # Create a more enticing course topic
-        course_topic = title.split(' - ')[0].lower().replace('full course', '').strip()
-        if not course_topic:
-            course_topic = "this topic"
-
-        caption = (
-            f"📚✏️ <b>{title}</b>\n"
-            f"🏅 <b>CERTIFIED</b>\n"
-            f"⏰ ASAP ({enrolls_left_text} Enrolls Left)\n"
-            f"⭐ {rating_text}    👩‍🎓 {students_text} students\n"
-            f"🌐 English (US)\n\n"
-            f"💡 Learn everything you need to know as a {course_topic} beginner.\n"
-            f"Become a {course_topic} expert!\n\n"
-            f"🔗 <a href='{redirect_url}'>Enroll Now</a>"
-        )
-
-        payload = {
-            'chat_id':    CHAT_ID,
-            'caption':    caption,
-            'parse_mode': 'HTML',
-            'reply_markup': json.dumps({
-                'inline_keyboard': [[{
-                    'text': '🎓 Enroll Now',
-                    'url':  redirect_url
-                }]]
-            })
-        }
-
-        # choose sendPhoto vs sendMessage
-        if img:
-            payload['photo'] = img
-            api_endpoint = f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
-        else:
-            payload['text'] = caption
-            api_endpoint = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-            payload.pop('caption')
-
-        # send to Telegram
-        resp = requests.post(api_endpoint, data=payload, timeout=10)
-        resp.raise_for_status()
-        result = resp.json()
-        if result.get('ok'):
-            logger.info(f"Sent course card: {slug}")
-        else:
-            logger.error(f"Telegram API error: {result}")
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        try:
+            # Get the next coupon
+            slug, coupon = coupon_db.get_next_coupon()
             
-    except Exception as e:
-        logger.error("Failed to send coupon", exc_info=True)
+            # Create redirect URL
+            redirect_url = f"{BASE_REDIRECT_URL}?udemy_url=" + urllib.parse.quote(
+                f"https://www.udemy.com/course/{slug}/?couponCode={coupon}", safe=''
+            )
+
+            # Get course details with retry mechanism
+            retries = 3
+            title, img, desc, rating, students = None, None, None, None, None
+            
+            while retries > 0:
+                try:
+                    title, img, desc, rating, students = fetch_course_details(slug)
+                    break
+                except Exception as e:
+                    logger.warning(f"Error fetching course details (attempt {4-retries}/3): {str(e)}")
+                    retries -= 1
+                    time.sleep(2)  # Wait 2 seconds before retry
+            
+            # If all retries failed, use fallback values
+            if not title:
+                title = slug.replace('-', ' ').title()
+                img = None
+                desc = 'Check out this course for exciting content!'
+                rating = round(random.uniform(3.5, 5.0), 1)
+                students = random.randint(5000, 100000)
+
+            # Generate a random number for enrolls left (between 1 and 1000)
+            enrolls_left = random.randint(1, 1000)
+
+            # Format the description to a maximum of 200 characters with ellipsis
+            short_desc = (desc[:197] + '...') if len(desc) > 200 else desc
+
+            # Build HTML caption with structured format
+            rating_text = f"{rating:.1f}/5"
+            students_text = f"{students:,}"
+            enrolls_left_text = f"{enrolls_left:,}"
+
+            # Clean up title to prevent HTML parsing issues
+            title = title.replace("<", "&lt;").replace(">", "&gt;")
+            
+            # Create a more enticing course topic
+            course_topic = title.split(' - ')[0].lower().replace('full course', '').strip()
+            if not course_topic:
+                course_topic = "this topic"
+
+            caption = (
+                f"📚✏️ <b>{title}</b>\n"
+                f"🏅 <b>CERTIFIED</b>\n"
+                f"⏰ ASAP ({enrolls_left_text} Enrolls Left)\n"
+                f"⭐ {rating_text}    👩‍🎓 {students_text} students\n"
+                f"🌐 English (US)\n\n"
+                f"💡 Learn everything you need to know as a {course_topic} beginner.\n"
+                f"Become a {course_topic} expert!\n\n"
+                f"🔗 <a href='{redirect_url}'>Enroll Now</a>"
+            )
+
+            payload = {
+                'chat_id':    CHAT_ID,
+                'caption':    caption,
+                'parse_mode': 'HTML',
+                'reply_markup': json.dumps({
+                    'inline_keyboard': [[{
+                        'text': '🎓 Enroll Now',
+                        'url':  redirect_url
+                    }]]
+                })
+            }
+
+            # choose sendPhoto vs sendMessage
+            if img:
+                payload['photo'] = img
+                api_endpoint = f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
+            else:
+                payload['text'] = caption
+                api_endpoint = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+                payload.pop('caption')
+
+            # send to Telegram with retry
+            for telegram_attempt in range(3):
+                try:
+                    resp = requests.post(api_endpoint, data=payload, timeout=15)
+                    resp.raise_for_status()
+                    result = resp.json()
+                    if result.get('ok'):
+                        logger.info(f"Sent course card: {slug}")
+                        return  # Success
+                    else:
+                        logger.error(f"Telegram API error: {result}")
+                        time.sleep(2)
+                except Exception as e:
+                    logger.error(f"Telegram API request failed (attempt {telegram_attempt+1}/3): {e}")
+                    time.sleep(2)
+                    continue
+            
+            # If we get here, all Telegram attempts failed
+            raise Exception("All Telegram API attempts failed")
+                
+        except Exception as e:
+            logger.error(f"Failed to send coupon (attempt {attempt+1}/{max_attempts}): {e}", exc_info=True)
+            if attempt < max_attempts - 1:
+                time.sleep(5)  # Wait before retry
+            else:
+                logger.error("All attempts to send coupon failed")
 
 # ─── MAIN ───────────────────────────────────────────────────
 if __name__ == '__main__':
