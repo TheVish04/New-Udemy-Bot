@@ -1,7 +1,8 @@
-Flask>=2.2.5
-requests>=2.31.0
-APScheduler>=3.10.1
-beautifulsoup4>=4.12.2
-selenium>=4.9.1
-webdriver-manager>=4.0.0
-python-dotenv>=1.0.0
+#!/bin/bash
+
+# Start Xvfb (virtual display server)
+Xvfb :99 -screen 0 1920x1080x24 > /dev/null 2>&1 &
+export DISPLAY=:99
+
+# Run the bot
+python bot.py
