@@ -18,13 +18,11 @@ from discudemy_scraper import DiscUdemyScraper
 # ─── CONFIG ────────────────────────────────────────────────
 TOKEN             = '7918306173:AAFFIedi9d4R8XDA0AlsOin8BCfJRJeNGWE'
 CHAT_ID           = '@udemyfreecourses2080'
-SCRAPE_INTERVAL   = 3600  # Scrape every hour (in seconds)
-POST_INTERVAL     = random.randint(60, 120)  # Post every 10-15 minutes (in seconds)
+SCRAPE_AND_POST_INTERVAL = 300  # Scrape and post every 5 minutes (300 seconds)
 BASE_REDIRECT_URL = 'https://udemyfreecoupons2080.blogspot.com'
 PORT              = 10000  # health-check endpoint port
-MAX_PAGES         = 3  # Increased since it's now faster without Selenium
-MAX_RETRY_ATTEMPTS = 3  # Reduced since HTTP requests are more reliable
-MIN_COUPONS_THRESHOLD = 1  # Minimum coupons needed to start posting
+MAX_PAGES         = 1  # Only scrape first page
+MAX_RETRY_ATTEMPTS = 3
 # ────────────────────────────────────────────────────────────
 
 # List of user agents to rotate through
@@ -45,51 +43,6 @@ logger    = logging.getLogger(__name__)
 scheduler = BlockingScheduler(timezone="UTC")
 # ────────────────────────────────────────────────────────────
 
-# Database to store and manage coupons
-class CouponDatabase:
-    def __init__(self):
-        self.coupons = []
-        self.posted_slugs = set()  # Track slugs that have already been posted
-        self.lock = threading.Lock()  # For thread safety
-        self.last_successful_scrape = None
-    
-    def update_coupons(self, new_coupons):
-        with self.lock:
-            # Filter out already posted courses
-            filtered_coupons = [(slug, code) for slug, code in new_coupons 
-                              if slug not in self.posted_slugs]
-            
-            # Update our database with new coupons
-            self.coupons.extend(filtered_coupons)
-            self.last_successful_scrape = datetime.now()
-            logger.info(f"Added {len(filtered_coupons)} new coupons to database. Total: {len(self.coupons)}")
-    
-    def get_next_coupon(self):
-        with self.lock:
-            if not self.coupons:
-                logger.warning("No coupons available in database")
-                return None
-                
-            # Get the next available coupon
-            coupon = self.coupons.pop(0)
-            
-            # Add the slug to posted set
-            self.posted_slugs.add(coupon[0])
-            
-            logger.info(f"Selected coupon: {coupon[0]}, {len(self.coupons)} remaining")
-            return coupon
-    
-    def has_enough_coupons(self):
-        with self.lock:
-            return len(self.coupons) >= MIN_COUPONS_THRESHOLD
-    
-    def get_coupon_count(self):
-        with self.lock:
-            return len(self.coupons)
-
-# Create our coupon database
-coupon_db = CouponDatabase()
-
 # ─── FLASK HEALTH CHECK ────────────────────────────────────
 app = Flask(__name__)
 
@@ -103,62 +56,6 @@ def root():
 
 def run_health_server():
     app.run(host="0.0.0.0", port=PORT, debug=False)
-
-# ─── DISCUDEMY SCRAPER ───────────────────────────────────
-def scrape_discudemy():
-    """Scrape DiscUdemy for fresh coupons and update the database"""
-    retry_count = 0
-    base_delay = 30  # Start with 30 seconds delay between retries
-    
-    while retry_count < MAX_RETRY_ATTEMPTS:
-        scraper = None
-        try:
-            logger.info(f"Starting DiscUdemy scraper for {MAX_PAGES} pages (attempt {retry_count + 1}/{MAX_RETRY_ATTEMPTS})")
-            
-            # Create lightweight scraper (no Selenium!)
-            scraper = DiscUdemyScraper(timeout=20)
-            
-            # Add delay before scraping if retrying
-            if retry_count > 0:
-                delay = base_delay * (retry_count + 1)
-                delay = min(delay, 120)  # Cap at 2 minutes
-                logger.info(f"Waiting {delay} seconds before retry...")
-                time.sleep(delay)
-            
-            results = scraper.scrape(max_pages=MAX_PAGES)
-            
-            if not results:
-                logger.warning(f"No coupons found during scraping attempt {retry_count + 1}")
-                retry_count += 1
-                continue
-                
-            # Convert to list of (slug, coupon_code) tuples
-            coupons = [(item['slug'], item['coupon_code']) for item in results 
-                       if item.get('slug') and item.get('coupon_code')]
-                
-            if not coupons:
-                logger.warning(f"No valid coupons extracted from results on attempt {retry_count + 1}")
-                retry_count += 1
-                continue
-                
-            logger.info(f"Successfully scraped {len(coupons)} valid coupons")
-            
-            # Update our database
-            coupon_db.update_coupons(coupons)
-            return  # Success - exit the retry loop
-            
-        except Exception as e:
-            logger.error(f"Error during scraping attempt {retry_count + 1}: {e}", exc_info=True)
-            retry_count += 1
-        finally:
-            # Always clean up the scraper
-            if scraper:
-                try:
-                    scraper.close()
-                except Exception as e:
-                    logger.warning(f"Error closing scraper: {e}")
-                
-    logger.error(f"All {MAX_RETRY_ATTEMPTS} scraping attempts failed")
 
 # ─── UDEMY SCRAPER ─────────────────────────────────────────
 def fetch_course_details(slug):
@@ -265,21 +162,9 @@ def fetch_course_details(slug):
     return title, thumbnail, description, rating, students
 
 # ─── TELEGRAM SENDER ───────────────────────────────────────
-def send_coupon():
+def send_coupon_to_telegram(slug, coupon):
+    """Send a single coupon to Telegram"""
     try:
-        # Check if we have enough coupons
-        if not coupon_db.has_enough_coupons():
-            logger.warning(f"Not enough coupons available ({coupon_db.get_coupon_count()}), skipping this cycle")
-            return
-        
-        # Get the next coupon
-        coupon_data = coupon_db.get_next_coupon()
-        if not coupon_data:
-            logger.warning("No coupon available, skipping this cycle")
-            return
-            
-        slug, coupon = coupon_data
-        
         # Create redirect URL
         redirect_url = f"{BASE_REDIRECT_URL}?udemy_url=" + urllib.parse.quote(
             f"https://www.udemy.com/course/{slug}/?couponCode={coupon}", safe=''
@@ -342,7 +227,7 @@ def send_coupon():
                 result = resp.json()
                 if result.get('ok'):
                     logger.info(f"Successfully sent course card: {slug}")
-                    return  # Success
+                    return True  # Success
                 else:
                     logger.error(f"Telegram API error: {result}")
                     if telegram_attempt < max_telegram_attempts - 1:
@@ -354,10 +239,79 @@ def send_coupon():
                     continue
         
         # If we get here, all Telegram attempts failed
-        logger.error("All Telegram API attempts failed for this coupon")
+        logger.error(f"All Telegram API attempts failed for coupon: {slug}")
+        return False
                 
     except Exception as e:
-        logger.error(f"Failed to send coupon: {e}", exc_info=True)
+        logger.error(f"Failed to send coupon {slug}: {e}", exc_info=True)
+        return False
+
+# ─── SCRAPE AND POST FUNCTION ──────────────────────────────
+def scrape_and_post():
+    """Scrape DiscUdemy and immediately post all found coupons"""
+    retry_count = 0
+    base_delay = 30  # Start with 30 seconds delay between retries
+    
+    while retry_count < MAX_RETRY_ATTEMPTS:
+        scraper = None
+        try:
+            logger.info(f"Starting DiscUdemy scraper for page 1 (attempt {retry_count + 1}/{MAX_RETRY_ATTEMPTS})")
+            
+            # Create lightweight scraper (no Selenium!)
+            scraper = DiscUdemyScraper(timeout=20)
+            
+            # Add delay before scraping if retrying
+            if retry_count > 0:
+                delay = base_delay * (retry_count + 1)
+                delay = min(delay, 120)  # Cap at 2 minutes
+                logger.info(f"Waiting {delay} seconds before retry...")
+                time.sleep(delay)
+            
+            results = scraper.scrape(max_pages=MAX_PAGES)
+            
+            if not results:
+                logger.warning(f"No coupons found during scraping attempt {retry_count + 1}")
+                retry_count += 1
+                continue
+                
+            # Convert to list of (slug, coupon_code) tuples
+            coupons = [(item['slug'], item['coupon_code']) for item in results 
+                       if item.get('slug') and item.get('coupon_code')]
+                
+            if not coupons:
+                logger.warning(f"No valid coupons extracted from results on attempt {retry_count + 1}")
+                retry_count += 1
+                continue
+                
+            logger.info(f"Successfully scraped {len(coupons)} valid coupons")
+            
+            # Send each coupon immediately
+            successful_posts = 0
+            for slug, coupon_code in coupons:
+                try:
+                    if send_coupon_to_telegram(slug, coupon_code):
+                        successful_posts += 1
+                    # Small delay between posts to avoid rate limiting
+                    time.sleep(2)
+                except Exception as e:
+                    logger.error(f"Error sending coupon {slug}: {e}")
+                    continue
+            
+            logger.info(f"Successfully posted {successful_posts}/{len(coupons)} coupons to Telegram")
+            return  # Success - exit the retry loop
+            
+        except Exception as e:
+            logger.error(f"Error during scraping attempt {retry_count + 1}: {e}", exc_info=True)
+            retry_count += 1
+        finally:
+            # Always clean up the scraper
+            if scraper:
+                try:
+                    scraper.close()
+                except Exception as e:
+                    logger.warning(f"Error closing scraper: {e}")
+                
+    logger.error(f"All {MAX_RETRY_ATTEMPTS} scraping attempts failed")
 
 # ─── MAIN ───────────────────────────────────────────────────
 if __name__ == '__main__':
@@ -365,48 +319,20 @@ if __name__ == '__main__':
     threading.Thread(target=run_health_server, daemon=True).start()
     logger.info(f"Health-check listening on port {PORT}")
 
-    # 2) Run initial scraper and wait for sufficient coupons
-    logger.info("Starting initial scrape...")
-    scrape_discudemy()
-    
-    # Wait for initial coupons before starting to post
-    initial_wait_time = 0
-    max_initial_wait = 900  # Wait up to 15 minutes for first coupons
-    
-    while not coupon_db.has_enough_coupons() and initial_wait_time < max_initial_wait:
-        logger.info(f"Waiting for sufficient coupons... Current: {coupon_db.get_coupon_count()}, Need: {MIN_COUPONS_THRESHOLD}")
-        time.sleep(60)  # Wait 1 minute
-        initial_wait_time += 60
-        
-        # Try scraping again if we don't have enough coupons
-        if initial_wait_time % 300 == 0:  # Every 5 minutes
-            logger.info("Retrying scrape to get more coupons...")
-            scrape_discudemy()
-    
-    if not coupon_db.has_enough_coupons():
-        logger.error(f"Could not get enough coupons after {max_initial_wait} seconds. Current: {coupon_db.get_coupon_count()}")
-        # Continue anyway - the scheduled scrapes might get more coupons
-    else:
-        logger.info(f"Initial scraping complete. Ready to start posting with {coupon_db.get_coupon_count()} coupons")
+    # 2) Run initial scrape and post
+    logger.info("Starting initial scrape and post...")
+    scrape_and_post()
 
-    # 3) Schedule the jobs
+    # 3) Schedule the job to run every 5 minutes
     scheduler.add_job(
-        func=scrape_discudemy,
+        func=scrape_and_post,
         trigger="interval",
-        seconds=SCRAPE_INTERVAL,
-        id="scraper_job",
-        replace_existing=True
-    )
-    
-    scheduler.add_job(
-        func=send_coupon,
-        trigger="interval",
-        seconds=POST_INTERVAL,
-        id="poster_job",
+        seconds=SCRAPE_AND_POST_INTERVAL,
+        id="scrape_and_post_job",
         replace_existing=True
     )
 
-    logger.info(f"Scheduler configured - Scraping every {SCRAPE_INTERVAL}s, Posting every {POST_INTERVAL}s")
+    logger.info(f"Scheduler configured - Scraping and posting every {SCRAPE_AND_POST_INTERVAL} seconds ({SCRAPE_AND_POST_INTERVAL//60} minutes)")
     
     # 4) Start the scheduler (this will block)
     try:
