@@ -81,17 +81,21 @@ def fetch_course_details(slug):
         'Sec-GPC': '1',
     }
     
-    # Add a random delay to avoid being rate-limited
-    time.sleep(random.uniform(1, 3))
+    # Add a longer random delay to avoid being rate-limited
+    time.sleep(random.uniform(3, 8))
     
     session = requests.Session()
     session.headers.update(headers)
     
     try:
         # Try to get the course page with timeout and retries
-        retries = 3
+        retries = 2  # Reduced retries to avoid excessive blocking
         for attempt in range(retries):
             try:
+                # Add longer delay between retry attempts
+                if attempt > 0:
+                    time.sleep(random.uniform(5, 10))
+                    
                 resp = session.get(url, timeout=15)
                 resp.raise_for_status()
                 
@@ -103,8 +107,8 @@ def fetch_course_details(slug):
                     
             except Exception as e:
                 if attempt < retries - 1:
-                    wait_time = (attempt + 1) * 2
-                    logger.warning(f"Request failed for {slug} (attempt {attempt+1}/{retries}): {e}. Waiting {wait_time}s...")
+                    wait_time = random.uniform(8, 15)  # Longer wait between retries
+                    logger.warning(f"Request failed for {slug} (attempt {attempt+1}/{retries}): {e}. Waiting {wait_time:.1f}s...")
                     time.sleep(wait_time)
                     continue
                 raise
@@ -292,7 +296,7 @@ def scrape_and_post():
                     if send_coupon_to_telegram(slug, coupon_code):
                         successful_posts += 1
                     # Small delay between posts to avoid rate limiting
-                    time.sleep(2)
+                    time.sleep(random.uniform(8, 15))
                 except Exception as e:
                     logger.error(f"Error sending coupon {slug}: {e}")
                     continue
