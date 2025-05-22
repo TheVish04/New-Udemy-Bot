@@ -4,11 +4,7 @@ services:
   udemy-bot:
     build: .
     restart: always
-    command: bash start.sh
     ports:
       - "10000:10000"
-    volumes:
-      - ./:/app
     environment:
       - PYTHONUNBUFFERED=1
-      - DISPLAY=:99

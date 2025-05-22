@@ -12,7 +12,7 @@ from flask import Flask
 from bs4 import BeautifulSoup
 import urllib.parse
 
-# Import our scraper module
+# Import our lightweight scraper module
 from discudemy_scraper import DiscUdemyScraper
 
 # ─── CONFIG ────────────────────────────────────────────────
@@ -22,9 +22,9 @@ SCRAPE_INTERVAL   = 3600  # Scrape every hour (in seconds)
 POST_INTERVAL     = random.randint(600, 900)  # Post every 10-15 minutes (in seconds)
 BASE_REDIRECT_URL = 'https://udemyfreecoupons2080.blogspot.com'
 PORT              = 10000  # health-check endpoint port
-MAX_PAGES         = 1  # Number of pages to scrape from discudemy
-MAX_RETRY_ATTEMPTS = 5  # Increased retry attempts
-MIN_COUPONS_THRESHOLD = 3  # Minimum coupons needed to start posting
+MAX_PAGES         = 3  # Increased since it's now faster without Selenium
+MAX_RETRY_ATTEMPTS = 3  # Reduced since HTTP requests are more reliable
+MIN_COUPONS_THRESHOLD = 5  # Minimum coupons needed to start posting
 # ────────────────────────────────────────────────────────────
 
 # List of user agents to rotate through
@@ -106,7 +106,7 @@ def run_health_server():
 
 # ─── DISCUDEMY SCRAPER ───────────────────────────────────
 def scrape_discudemy():
-    """Scrape DiscUdemy for fresh coupons and update the database with improved retry mechanism"""
+    """Scrape DiscUdemy for fresh coupons and update the database"""
     retry_count = 0
     base_delay = 30  # Start with 30 seconds delay between retries
     
@@ -115,13 +115,13 @@ def scrape_discudemy():
         try:
             logger.info(f"Starting DiscUdemy scraper for {MAX_PAGES} pages (attempt {retry_count + 1}/{MAX_RETRY_ATTEMPTS})")
             
-            # Create scraper with longer timeout for unstable connections
-            scraper = DiscUdemyScraper(headless=True, timeout=30)
+            # Create lightweight scraper (no Selenium!)
+            scraper = DiscUdemyScraper(timeout=20)
             
-            # Add delay before scraping to avoid immediate connection issues
+            # Add delay before scraping if retrying
             if retry_count > 0:
-                delay = base_delay * (2 ** (retry_count - 1))  # Exponential backoff
-                delay = min(delay, 300)  # Cap at 5 minutes
+                delay = base_delay * (retry_count + 1)
+                delay = min(delay, 120)  # Cap at 2 minutes
                 logger.info(f"Waiting {delay} seconds before retry...")
                 time.sleep(delay)
             
@@ -134,7 +134,7 @@ def scrape_discudemy():
                 
             # Convert to list of (slug, coupon_code) tuples
             coupons = [(item['slug'], item['coupon_code']) for item in results 
-                       if item['slug'] and item['coupon_code']]
+                       if item.get('slug') and item.get('coupon_code')]
                 
             if not coupons:
                 logger.warning(f"No valid coupons extracted from results on attempt {retry_count + 1}")
@@ -185,17 +185,17 @@ def fetch_course_details(slug):
     }
     
     # Add a random delay to avoid being rate-limited
-    time.sleep(random.uniform(2, 5))
+    time.sleep(random.uniform(1, 3))
     
     session = requests.Session()
     session.headers.update(headers)
     
     try:
         # Try to get the course page with timeout and retries
-        retries = 5
+        retries = 3
         for attempt in range(retries):
             try:
-                resp = session.get(url, timeout=20)
+                resp = session.get(url, timeout=15)
                 resp.raise_for_status()
                 
                 # Check if we got a valid response
@@ -302,11 +302,6 @@ def send_coupon():
         # Clean up title to prevent HTML parsing issues
         title = title.replace("<", "&lt;").replace(">", "&gt;").replace("&", "&amp;")
         
-        # Create a more enticing course topic
-        course_topic = title.split(' - ')[0].lower().replace('full course', '').replace('complete', '').strip()
-        if len(course_topic) < 3:
-            course_topic = "this subject"
-
         caption = (
             f"📚✏️ <b>{title}</b>\n"
             f"🏅 <b>CERTIFIED COURSE</b>\n"
@@ -342,7 +337,7 @@ def send_coupon():
         max_telegram_attempts = 3
         for telegram_attempt in range(max_telegram_attempts):
             try:
-                resp = requests.post(api_endpoint, data=payload, timeout=20)
+                resp = requests.post(api_endpoint, data=payload, timeout=15)
                 resp.raise_for_status()
                 result = resp.json()
                 if result.get('ok'):
@@ -376,7 +371,7 @@ if __name__ == '__main__':
     
     # Wait for initial coupons before starting to post
     initial_wait_time = 0
-    max_initial_wait = 1800  # Wait up to 30 minutes for first coupons
+    max_initial_wait = 900  # Wait up to 15 minutes for first coupons
     
     while not coupon_db.has_enough_coupons() and initial_wait_time < max_initial_wait:
         logger.info(f"Waiting for sufficient coupons... Current: {coupon_db.get_coupon_count()}, Need: {MIN_COUPONS_THRESHOLD}")
@@ -384,37 +379,4 @@ if __name__ == '__main__':
         initial_wait_time += 60
         
         # Try scraping again if we don't have enough coupons
-        if initial_wait_time % 300 == 0:  # Every 5 minutes
-            logger.info("Retrying scrape for initial coupons...")
-            scrape_discudemy()
-
-    if coupon_db.has_enough_coupons():
-        logger.info("Sufficient coupons available, starting posting cycle...")
-        # Send first coupon
-        send_coupon()
-    else:
-        logger.warning("Could not gather sufficient coupons during initial period")
-
-    # 3) Schedule periodic scraping (every hour)
-    scheduler.add_job(
-        scrape_discudemy,
-        'interval',
-        seconds=SCRAPE_INTERVAL,
-        next_run_time=datetime.now() + timedelta(seconds=SCRAPE_INTERVAL),
-        id='scraper_job'
-    )
-
-    # 4) Schedule periodic posting (every 10-15 minutes)
-    scheduler.add_job(
-        send_coupon,
-        'interval',
-        seconds=POST_INTERVAL,
-        next_run_time=datetime.now() + timedelta(seconds=POST_INTERVAL),
-        id='poster_job'
-    )
-
-    logger.info("Scheduler started. Bot is now running...")
-    try:
-        scheduler.start()
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Scheduler stopped.")
+        if initial_
