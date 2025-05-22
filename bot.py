@@ -18,7 +18,7 @@ from discudemy_scraper import DiscUdemyScraper
 # ─── CONFIG ────────────────────────────────────────────────
 TOKEN             = '7918306173:AAFFIedi9d4R8XDA0AlsOin8BCfJRJeNGWE'
 CHAT_ID           = '@udemyfreecourses2080'
-SCRAPE_AND_POST_INTERVAL = 300  # Scrape and post every 5 minutes (300 seconds)
+SCRAPE_AND_POST_INTERVAL = 600  # Scrape and post every 5 minutes (300 seconds)
 BASE_REDIRECT_URL = 'https://udemyfreecoupons2080.blogspot.com'
 PORT              = 10000  # health-check endpoint port
 MAX_PAGES         = 1  # Only scrape first page
