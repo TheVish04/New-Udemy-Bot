@@ -24,7 +24,7 @@ BASE_REDIRECT_URL = 'https://udemyfreecoupons2080.blogspot.com'
 PORT              = 10000  # health-check endpoint port
 MAX_PAGES         = 3  # Increased since it's now faster without Selenium
 MAX_RETRY_ATTEMPTS = 3  # Reduced since HTTP requests are more reliable
-MIN_COUPONS_THRESHOLD = 5  # Minimum coupons needed to start posting
+MIN_COUPONS_THRESHOLD = 1  # Minimum coupons needed to start posting
 # ────────────────────────────────────────────────────────────
 
 # List of user agents to rotate through
