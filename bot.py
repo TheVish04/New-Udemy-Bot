@@ -23,7 +23,8 @@ POST_INTERVAL     = random.randint(600, 900)  # Post every 10-15 minutes (in sec
 BASE_REDIRECT_URL = 'https://udemyfreecoupons2080.blogspot.com'
 PORT              = 10000  # health-check endpoint port
 MAX_PAGES         = 1  # Number of pages to scrape from discudemy
-MAX_RETRY_ATTEMPTS = 3  # Number of times to retry scraping if it fails
+MAX_RETRY_ATTEMPTS = 5  # Increased retry attempts
+MIN_COUPONS_THRESHOLD = 3  # Minimum coupons needed to start posting
 # ────────────────────────────────────────────────────────────
 
 # List of user agents to rotate through
@@ -33,11 +34,6 @@ USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0',
     'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
     'Mozilla/5.0 (iPad; CPU OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
-]
-
-# Fallback coupons if scraping fails
-STATIC_COUPONS = [
-    ('the-complete-python-bootcamp-from-zero-to-expert', 'ST6MT60525G3')
 ]
 
 # ─── LOGGING & SCHEDULER SETUP ─────────────────────────────
@@ -55,6 +51,7 @@ class CouponDatabase:
         self.coupons = []
         self.posted_slugs = set()  # Track slugs that have already been posted
         self.lock = threading.Lock()  # For thread safety
+        self.last_successful_scrape = None
     
     def update_coupons(self, new_coupons):
         with self.lock:
@@ -64,13 +61,14 @@ class CouponDatabase:
             
             # Update our database with new coupons
             self.coupons.extend(filtered_coupons)
-            logger.info(f"Added {len(filtered_coupons)} new coupons to database")
+            self.last_successful_scrape = datetime.now()
+            logger.info(f"Added {len(filtered_coupons)} new coupons to database. Total: {len(self.coupons)}")
     
     def get_next_coupon(self):
         with self.lock:
             if not self.coupons:
-                logger.warning("No coupons available in database, using fallback")
-                return STATIC_COUPONS[0]
+                logger.warning("No coupons available in database")
+                return None
                 
             # Get the next available coupon
             coupon = self.coupons.pop(0)
@@ -80,6 +78,14 @@ class CouponDatabase:
             
             logger.info(f"Selected coupon: {coupon[0]}, {len(self.coupons)} remaining")
             return coupon
+    
+    def has_enough_coupons(self):
+        with self.lock:
+            return len(self.coupons) >= MIN_COUPONS_THRESHOLD
+    
+    def get_coupon_count(self):
+        with self.lock:
+            return len(self.coupons)
 
 # Create our coupon database
 coupon_db = CouponDatabase()
@@ -91,58 +97,73 @@ app = Flask(__name__)
 def healthz():
     return "OK", 200
 
+@app.route("/")
+def root():
+    return "Udemy Coupon Bot is running", 404  # Return 404 as expected by logs
+
 def run_health_server():
-    app.run(host="0.0.0.0", port=PORT)
+    app.run(host="0.0.0.0", port=PORT, debug=False)
 
 # ─── DISCUDEMY SCRAPER ───────────────────────────────────
 def scrape_discudemy():
-    """Scrape DiscUdemy for fresh coupons and update the database with retry mechanism"""
+    """Scrape DiscUdemy for fresh coupons and update the database with improved retry mechanism"""
     retry_count = 0
+    base_delay = 30  # Start with 30 seconds delay between retries
+    
     while retry_count < MAX_RETRY_ATTEMPTS:
+        scraper = None
         try:
             logger.info(f"Starting DiscUdemy scraper for {MAX_PAGES} pages (attempt {retry_count + 1}/{MAX_RETRY_ATTEMPTS})")
             
-            scraper = DiscUdemyScraper(headless=True)
-            try:
-                results = scraper.scrape(max_pages=MAX_PAGES)
-                
-                if not results:
-                    logger.warning("No coupons found during scraping")
-                    retry_count += 1
-                    time.sleep(60)  # Wait a minute before retrying
-                    continue
-                    
-                # Convert to list of (slug, coupon_code) tuples
-                coupons = [(item['slug'], item['coupon_code']) for item in results 
-                           if item['slug'] and item['coupon_code']]
-                    
-                logger.info(f"Successfully scraped {len(coupons)} valid coupons")
-                
-                # Update our database
-                coupon_db.update_coupons(coupons)
-                return  # Success - exit the retry loop
-                
-            except Exception as e:
-                logger.error(f"Error during scraping attempt {retry_count + 1}: {e}", exc_info=True)
+            # Create scraper with longer timeout for unstable connections
+            scraper = DiscUdemyScraper(headless=True, timeout=30)
+            
+            # Add delay before scraping to avoid immediate connection issues
+            if retry_count > 0:
+                delay = base_delay * (2 ** (retry_count - 1))  # Exponential backoff
+                delay = min(delay, 300)  # Cap at 5 minutes
+                logger.info(f"Waiting {delay} seconds before retry...")
+                time.sleep(delay)
+            
+            results = scraper.scrape(max_pages=MAX_PAGES)
+            
+            if not results:
+                logger.warning(f"No coupons found during scraping attempt {retry_count + 1}")
                 retry_count += 1
-                time.sleep(60)  # Wait before retry
-            finally:
+                continue
+                
+            # Convert to list of (slug, coupon_code) tuples
+            coupons = [(item['slug'], item['coupon_code']) for item in results 
+                       if item['slug'] and item['coupon_code']]
+                
+            if not coupons:
+                logger.warning(f"No valid coupons extracted from results on attempt {retry_count + 1}")
+                retry_count += 1
+                continue
+                
+            logger.info(f"Successfully scraped {len(coupons)} valid coupons")
+            
+            # Update our database
+            coupon_db.update_coupons(coupons)
+            return  # Success - exit the retry loop
+            
+        except Exception as e:
+            logger.error(f"Error during scraping attempt {retry_count + 1}: {e}", exc_info=True)
+            retry_count += 1
+        finally:
+            # Always clean up the scraper
+            if scraper:
                 try:
                     scraper.close()
-                except:
-                    pass
+                except Exception as e:
+                    logger.warning(f"Error closing scraper: {e}")
                 
-        except Exception as e:
-            logger.error(f"Failed to initialize scraper (attempt {retry_count + 1}): {e}", exc_info=True)
-            retry_count += 1
-            time.sleep(60)  # Wait before retry
-    
     logger.error(f"All {MAX_RETRY_ATTEMPTS} scraping attempts failed")
 
 # ─── UDEMY SCRAPER ─────────────────────────────────────────
 def fetch_course_details(slug):
     """
-    Scrape Udemy course page with improved error handling
+    Scrape Udemy course page with improved error handling and retries
     """
     url = f"https://www.udemy.com/course/{slug}/"
     
@@ -159,25 +180,35 @@ def fetch_course_details(slug):
         'Sec-Fetch-Site': 'none',
         'Sec-Fetch-User': '?1',
         'Cache-Control': 'max-age=0',
+        'DNT': '1',
+        'Sec-GPC': '1',
     }
     
-    # Add a delay to avoid being rate-limited (random between 1-3 seconds)
-    time.sleep(random.uniform(1, 3))
+    # Add a random delay to avoid being rate-limited
+    time.sleep(random.uniform(2, 5))
     
     session = requests.Session()
+    session.headers.update(headers)
     
     try:
         # Try to get the course page with timeout and retries
-        retries = 3
+        retries = 5
         for attempt in range(retries):
             try:
-                resp = session.get(url, headers=headers, timeout=15)
+                resp = session.get(url, timeout=20)
                 resp.raise_for_status()
-                break
-            except (requests.RequestException, Exception) as e:
+                
+                # Check if we got a valid response
+                if resp.status_code == 200 and len(resp.content) > 1000:
+                    break
+                else:
+                    raise requests.RequestException(f"Invalid response: {resp.status_code}")
+                    
+            except Exception as e:
                 if attempt < retries - 1:
-                    logger.warning(f"Request failed (attempt {attempt+1}/{retries}): {e}")
-                    time.sleep(2)
+                    wait_time = (attempt + 1) * 2
+                    logger.warning(f"Request failed for {slug} (attempt {attempt+1}/{retries}): {e}. Waiting {wait_time}s...")
+                    time.sleep(wait_time)
                     continue
                 raise
                 
@@ -189,173 +220,200 @@ def fetch_course_details(slug):
             og_data[meta['property']] = meta.get('content', '')
         
         # Get title, thumbnail, and description
-        title = og_data.get('og:title')
-        thumbnail = og_data.get('og:image')
-        description = og_data.get('og:description')
+        title = og_data.get('og:title', '').strip()
+        thumbnail = og_data.get('og:image', '').strip()
+        description = og_data.get('og:description', '').strip()
         
-        # If any of the key data is missing, raise an exception
-        if not title or not thumbnail or not description:
-            raise ValueError("Missing required metadata from course page")
+        # Fallback extraction if OG tags are missing
+        if not title:
+            title_tag = soup.find('title')
+            if title_tag:
+                title = title_tag.get_text().strip()
+        
+        if not description:
+            desc_meta = soup.find('meta', attrs={'name': 'description'})
+            if desc_meta:
+                description = desc_meta.get('content', '').strip()
+        
+        # If any of the key data is still missing, use reasonable defaults
+        if not title:
+            title = slug.replace('-', ' ').title()
+        if not description:
+            description = f'Learn {title} with this comprehensive course!'
+            
+        # Clean up title and description
+        title = title.replace(' | Udemy', '').strip()
+        if len(title) > 100:
+            title = title[:97] + '...'
             
         logger.info(f"Successfully scraped course: {slug}")
         
     except Exception as e:
-        logger.warning(f"Scraping Udemy failed for {slug}—using fallback: {str(e)}")
+        logger.warning(f"Scraping Udemy failed for {slug}: {str(e)}")
+        # Use fallback values
         title = slug.replace('-', ' ').title()
         thumbnail = None
-        description = 'Check out this course for exciting content!'
+        description = f'Learn {title} with this comprehensive course!'
 
     # Close the session
     session.close()
 
-    # Generate random rating and students
-    rating = round(random.uniform(4.0, 5.0), 1)  # Higher ratings look better
-    students = random.randint(5000, 100000)      # More students look better
+    # Generate realistic random rating and students
+    rating = round(random.uniform(4.2, 4.9), 1)  # Higher ratings look better
+    students = random.randint(10000, 150000)      # More students look better
 
     return title, thumbnail, description, rating, students
 
 # ─── TELEGRAM SENDER ───────────────────────────────────────
 def send_coupon():
-    max_attempts = 3
-    for attempt in range(max_attempts):
-        try:
-            # Get the next coupon
-            slug, coupon = coupon_db.get_next_coupon()
+    try:
+        # Check if we have enough coupons
+        if not coupon_db.has_enough_coupons():
+            logger.warning(f"Not enough coupons available ({coupon_db.get_coupon_count()}), skipping this cycle")
+            return
+        
+        # Get the next coupon
+        coupon_data = coupon_db.get_next_coupon()
+        if not coupon_data:
+            logger.warning("No coupon available, skipping this cycle")
+            return
             
-            # Create redirect URL
-            redirect_url = f"{BASE_REDIRECT_URL}?udemy_url=" + urllib.parse.quote(
-                f"https://www.udemy.com/course/{slug}/?couponCode={coupon}", safe=''
-            )
+        slug, coupon = coupon_data
+        
+        # Create redirect URL
+        redirect_url = f"{BASE_REDIRECT_URL}?udemy_url=" + urllib.parse.quote(
+            f"https://www.udemy.com/course/{slug}/?couponCode={coupon}", safe=''
+        )
 
-            # Get course details with retry mechanism
-            retries = 3
-            title, img, desc, rating, students = None, None, None, None, None
-            
-            while retries > 0:
-                try:
-                    title, img, desc, rating, students = fetch_course_details(slug)
-                    break
-                except Exception as e:
-                    logger.warning(f"Error fetching course details (attempt {4-retries}/3): {str(e)}")
-                    retries -= 1
-                    time.sleep(2)  # Wait 2 seconds before retry
-            
-            # If all retries failed, use fallback values
-            if not title:
-                title = slug.replace('-', ' ').title()
-                img = None
-                desc = 'Check out this course for exciting content!'
-                rating = round(random.uniform(3.5, 5.0), 1)
-                students = random.randint(5000, 100000)
+        # Get course details with retry mechanism
+        title, img, desc, rating, students = fetch_course_details(slug)
 
-            # Generate a random number for enrolls left (between 1 and 1000)
-            enrolls_left = random.randint(1, 1000)
+        # Generate a random number for enrolls left (between 50 and 2000)
+        enrolls_left = random.randint(50, 2000)
 
-            # Format the description to a maximum of 200 characters with ellipsis
-            short_desc = (desc[:197] + '...') if len(desc) > 200 else desc
+        # Format the description to a maximum of 180 characters with ellipsis
+        short_desc = (desc[:177] + '...') if len(desc) > 180 else desc
 
-            # Build HTML caption with structured format
-            rating_text = f"{rating:.1f}/5"
-            students_text = f"{students:,}"
-            enrolls_left_text = f"{enrolls_left:,}"
+        # Build HTML caption with structured format
+        rating_text = f"{rating:.1f}/5"
+        students_text = f"{students:,}"
+        enrolls_left_text = f"{enrolls_left:,}"
 
-            # Clean up title to prevent HTML parsing issues
-            title = title.replace("<", "&lt;").replace(">", "&gt;")
-            
-            # Create a more enticing course topic
-            course_topic = title.split(' - ')[0].lower().replace('full course', '').strip()
-            if not course_topic:
-                course_topic = "this topic"
+        # Clean up title to prevent HTML parsing issues
+        title = title.replace("<", "&lt;").replace(">", "&gt;").replace("&", "&amp;")
+        
+        # Create a more enticing course topic
+        course_topic = title.split(' - ')[0].lower().replace('full course', '').replace('complete', '').strip()
+        if len(course_topic) < 3:
+            course_topic = "this subject"
 
-            caption = (
-                f"📚✏️ <b>{title}</b>\n"
-                f"🏅 <b>CERTIFIED</b>\n"
-                f"⏰ ASAP ({enrolls_left_text} Enrolls Left)\n"
-                f"⭐ {rating_text}    👩‍🎓 {students_text} students\n"
-                f"🌐 English (US)\n\n"
-                f"💡 Learn everything you need to know as a {course_topic} beginner.\n"
-                f"Become a {course_topic} expert!\n\n"
-                f"🔗 <a href='{redirect_url}'>Enroll Now</a>"
-            )
+        caption = (
+            f"📚✏️ <b>{title}</b>\n"
+            f"🏅 <b>CERTIFIED COURSE</b>\n"
+            f"⏰ LIMITED TIME ({enrolls_left_text} Enrolls Left)\n"
+            f"⭐ {rating_text}    👩‍🎓 {students_text} students\n"
+            f"🌐 English Language\n\n"
+            f"💡 {short_desc}\n\n"
+            f"🔗 <a href='{redirect_url}'>Enroll Now for FREE</a>"
+        )
 
-            payload = {
-                'chat_id':    CHAT_ID,
-                'caption':    caption,
-                'parse_mode': 'HTML',
-                'reply_markup': json.dumps({
-                    'inline_keyboard': [[{
-                        'text': '🎓 Enroll Now',
-                        'url':  redirect_url
-                    }]]
-                })
-            }
+        payload = {
+            'chat_id':    CHAT_ID,
+            'caption':    caption,
+            'parse_mode': 'HTML',
+            'reply_markup': json.dumps({
+                'inline_keyboard': [[{
+                    'text': '🎓 Get Free Course',
+                    'url':  redirect_url
+                }]]
+            })
+        }
 
-            # choose sendPhoto vs sendMessage
-            if img:
-                payload['photo'] = img
-                api_endpoint = f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
-            else:
-                payload['text'] = caption
-                api_endpoint = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-                payload.pop('caption')
+        # Choose sendPhoto vs sendMessage
+        if img and img.startswith('http'):
+            payload['photo'] = img
+            api_endpoint = f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
+        else:
+            payload['text'] = caption
+            api_endpoint = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+            payload.pop('caption', None)
 
-            # send to Telegram with retry
-            for telegram_attempt in range(3):
-                try:
-                    resp = requests.post(api_endpoint, data=payload, timeout=15)
-                    resp.raise_for_status()
-                    result = resp.json()
-                    if result.get('ok'):
-                        logger.info(f"Sent course card: {slug}")
-                        return  # Success
-                    else:
-                        logger.error(f"Telegram API error: {result}")
-                        time.sleep(2)
-                except Exception as e:
-                    logger.error(f"Telegram API request failed (attempt {telegram_attempt+1}/3): {e}")
-                    time.sleep(2)
+        # Send to Telegram with retry
+        max_telegram_attempts = 3
+        for telegram_attempt in range(max_telegram_attempts):
+            try:
+                resp = requests.post(api_endpoint, data=payload, timeout=20)
+                resp.raise_for_status()
+                result = resp.json()
+                if result.get('ok'):
+                    logger.info(f"Successfully sent course card: {slug}")
+                    return  # Success
+                else:
+                    logger.error(f"Telegram API error: {result}")
+                    if telegram_attempt < max_telegram_attempts - 1:
+                        time.sleep(3)
+            except Exception as e:
+                logger.error(f"Telegram API request failed (attempt {telegram_attempt+1}/{max_telegram_attempts}): {e}")
+                if telegram_attempt < max_telegram_attempts - 1:
+                    time.sleep(3)
                     continue
-            
-            # If we get here, all Telegram attempts failed
-            raise Exception("All Telegram API attempts failed")
+        
+        # If we get here, all Telegram attempts failed
+        logger.error("All Telegram API attempts failed for this coupon")
                 
-        except Exception as e:
-            logger.error(f"Failed to send coupon (attempt {attempt+1}/{max_attempts}): {e}", exc_info=True)
-            if attempt < max_attempts - 1:
-                time.sleep(5)  # Wait before retry
-            else:
-                logger.error("All attempts to send coupon failed")
+    except Exception as e:
+        logger.error(f"Failed to send coupon: {e}", exc_info=True)
 
 # ─── MAIN ───────────────────────────────────────────────────
 if __name__ == '__main__':
-    # 1) start health-check server
+    # 1) Start health-check server
     threading.Thread(target=run_health_server, daemon=True).start()
     logger.info(f"Health-check listening on port {PORT}")
 
-    # 2) run the initial scraper
+    # 2) Run initial scraper and wait for sufficient coupons
     logger.info("Starting initial scrape...")
     scrape_discudemy()
+    
+    # Wait for initial coupons before starting to post
+    initial_wait_time = 0
+    max_initial_wait = 1800  # Wait up to 30 minutes for first coupons
+    
+    while not coupon_db.has_enough_coupons() and initial_wait_time < max_initial_wait:
+        logger.info(f"Waiting for sufficient coupons... Current: {coupon_db.get_coupon_count()}, Need: {MIN_COUPONS_THRESHOLD}")
+        time.sleep(60)  # Wait 1 minute
+        initial_wait_time += 60
+        
+        # Try scraping again if we don't have enough coupons
+        if initial_wait_time % 300 == 0:  # Every 5 minutes
+            logger.info("Retrying scrape for initial coupons...")
+            scrape_discudemy()
 
-    # 3) send first coupon immediately
-    logger.info("Sending first coupon...")
-    send_coupon()
+    if coupon_db.has_enough_coupons():
+        logger.info("Sufficient coupons available, starting posting cycle...")
+        # Send first coupon
+        send_coupon()
+    else:
+        logger.warning("Could not gather sufficient coupons during initial period")
 
-    # 4) schedule periodic scraping
+    # 3) Schedule periodic scraping (every hour)
     scheduler.add_job(
         scrape_discudemy,
         'interval',
         seconds=SCRAPE_INTERVAL,
         next_run_time=datetime.now() + timedelta(seconds=SCRAPE_INTERVAL),
+        id='scraper_job'
     )
 
-    # 5) schedule periodic posting
+    # 4) Schedule periodic posting (every 10-15 minutes)
     scheduler.add_job(
         send_coupon,
         'interval',
         seconds=POST_INTERVAL,
         next_run_time=datetime.now() + timedelta(seconds=POST_INTERVAL),
+        id='poster_job'
     )
 
+    logger.info("Scheduler started. Bot is now running...")
     try:
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):
