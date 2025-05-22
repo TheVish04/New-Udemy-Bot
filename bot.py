@@ -19,7 +19,7 @@ from discudemy_scraper import DiscUdemyScraper
 TOKEN             = '7918306173:AAFFIedi9d4R8XDA0AlsOin8BCfJRJeNGWE'
 CHAT_ID           = '@udemyfreecourses2080'
 SCRAPE_INTERVAL   = 3600  # Scrape every hour (in seconds)
-POST_INTERVAL     = random.randint(600, 900)  # Post every 10-15 minutes (in seconds)
+POST_INTERVAL     = random.randint(60, 120)  # Post every 10-15 minutes (in seconds)
 BASE_REDIRECT_URL = 'https://udemyfreecoupons2080.blogspot.com'
 PORT              = 10000  # health-check endpoint port
 MAX_PAGES         = 3  # Increased since it's now faster without Selenium
