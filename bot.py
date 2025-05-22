@@ -379,4 +379,41 @@ if __name__ == '__main__':
         initial_wait_time += 60
         
         # Try scraping again if we don't have enough coupons
-        if initial_
+        if initial_wait_time % 300 == 0:  # Every 5 minutes
+            logger.info("Retrying scrape to get more coupons...")
+            scrape_discudemy()
+    
+    if not coupon_db.has_enough_coupons():
+        logger.error(f"Could not get enough coupons after {max_initial_wait} seconds. Current: {coupon_db.get_coupon_count()}")
+        # Continue anyway - the scheduled scrapes might get more coupons
+    else:
+        logger.info(f"Initial scraping complete. Ready to start posting with {coupon_db.get_coupon_count()} coupons")
+
+    # 3) Schedule the jobs
+    scheduler.add_job(
+        func=scrape_discudemy,
+        trigger="interval",
+        seconds=SCRAPE_INTERVAL,
+        id="scraper_job",
+        replace_existing=True
+    )
+    
+    scheduler.add_job(
+        func=send_coupon,
+        trigger="interval",
+        seconds=POST_INTERVAL,
+        id="poster_job",
+        replace_existing=True
+    )
+
+    logger.info(f"Scheduler configured - Scraping every {SCRAPE_INTERVAL}s, Posting every {POST_INTERVAL}s")
+    
+    # 4) Start the scheduler (this will block)
+    try:
+        scheduler.start()
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.error(f"Scheduler error: {e}", exc_info=True)
+    finally:
+        logger.info("Bot shutdown complete")
