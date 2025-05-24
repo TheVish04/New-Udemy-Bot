@@ -18,8 +18,8 @@ from discudemy_scraper import DiscUdemyScraper
 # ─── CONFIG ────────────────────────────────────────────────
 TOKEN             = '7918306173:AAFFIedi9d4R8XDA0AlsOin8BCfJRJeNGWE'
 CHAT_ID           = '@udemyfreecourses2080'
-SCRAPE_INTERVAL   = 3600  # Scrape every hour (in seconds)
-POST_INTERVAL     = random.randint(60, 120)  # Post every 10-15 minutes (in seconds)
+SCRAPE_INTERVAL   = 1800  # Scrape every hour (in seconds)
+POST_INTERVAL     = random.randint(60, 61)  # Post every 10-15 minutes (in seconds)
 BASE_REDIRECT_URL = 'https://udemyfreecoupons2080.blogspot.com'
 PORT              = 10000  # health-check endpoint port
 MAX_PAGES         = 5  # Increased since it's now faster without Selenium
@@ -186,11 +186,11 @@ def send_coupon():
         )
 
         # Generate realistic random rating and students
-        rating = round(random.uniform(4.2, 4.9), 1)  # Higher ratings look better
-        students = random.randint(10000, 150000)      # More students look better
+        rating = round(random.uniform(3.0, 4.9), 1)  # Higher ratings look better
+        students = random.randint(100, 50000)      # More students look better
 
         # Generate a random number for enrolls left (between 50 and 2000)
-        enrolls_left = random.randint(50, 2000)
+        enrolls_left = random.randint(50, 1000)
 
         # Format the description to a maximum of 180 characters with ellipsis
         short_desc = (desc[:177] + '...') if len(desc) > 180 else desc
@@ -204,13 +204,12 @@ def send_coupon():
         title = title.replace("<", "&lt;").replace(">", "&gt;").replace("&", "&amp;")
         
         caption = (
-            f"📚✏️ <b>{title}</b>\n"
-            f"🏅 <b>CERTIFIED COURSE</b>\n"
+            f"✏️ <b>{title}</b>\n\n"
             f"⏰ LIMITED TIME ({enrolls_left_text} Enrolls Left)\n"
-            f"⭐ {rating_text}    👩‍🎓 {students_text} students\n"
+            f"⭐ {rating_text}\n"
+            f"👩‍🎓 {students_text} students\n"
             f"🌐 English Language\n\n"
-            f"💡 {short_desc}\n\n"
-            f"🔗 <a href='{redirect_url}'>Enroll Now for FREE</a>"
+            f"💡 {short_desc}"
         )
 
         payload = {
