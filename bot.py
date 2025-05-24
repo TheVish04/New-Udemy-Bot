@@ -56,8 +56,8 @@ class CouponDatabase:
     def update_coupons(self, new_coupons):
         with self.lock:
             # Filter out already posted courses
-            filtered_coupons = [(slug, code) for slug, code in new_coupons 
-                              if slug not in self.posted_slugs]
+            filtered_coupons = [coupon for coupon in new_coupons 
+                              if coupon.get('slug') not in self.posted_slugs]
             
             # Update our database with new coupons
             self.coupons.extend(filtered_coupons)
@@ -74,9 +74,9 @@ class CouponDatabase:
             coupon = self.coupons.pop(0)
             
             # Add the slug to posted set
-            self.posted_slugs.add(coupon[0])
+            self.posted_slugs.add(coupon.get('slug'))
             
-            logger.info(f"Selected coupon: {coupon[0]}, {len(self.coupons)} remaining")
+            logger.info(f"Selected coupon: {coupon.get('slug')}, {len(self.coupons)} remaining")
             return coupon
     
     def has_enough_coupons(self):
@@ -132,19 +132,19 @@ def scrape_discudemy():
                 retry_count += 1
                 continue
                 
-            # Convert to list of (slug, coupon_code) tuples
-            coupons = [(item['slug'], item['coupon_code']) for item in results 
-                       if item.get('slug') and item.get('coupon_code')]
+            # Results now contain full course information
+            valid_coupons = [item for item in results 
+                           if item.get('slug') and item.get('coupon_code')]
                 
-            if not coupons:
+            if not valid_coupons:
                 logger.warning(f"No valid coupons extracted from results on attempt {retry_count + 1}")
                 retry_count += 1
                 continue
                 
-            logger.info(f"Successfully scraped {len(coupons)} valid coupons")
+            logger.info(f"Successfully scraped {len(valid_coupons)} valid coupons with course info")
             
             # Update our database
-            coupon_db.update_coupons(coupons)
+            coupon_db.update_coupons(valid_coupons)
             return  # Success - exit the retry loop
             
         except Exception as e:
@@ -160,110 +160,6 @@ def scrape_discudemy():
                 
     logger.error(f"All {MAX_RETRY_ATTEMPTS} scraping attempts failed")
 
-# ─── UDEMY SCRAPER ─────────────────────────────────────────
-def fetch_course_details(slug):
-    """
-    Scrape Udemy course page with improved error handling and retries
-    """
-    url = f"https://www.udemy.com/course/{slug}/"
-    
-    # Use a random user agent and add more browser-like headers
-    headers = {
-        'User-Agent': random.choice(USER_AGENTS),
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'none',
-        'Sec-Fetch-User': '?1',
-        'Cache-Control': 'max-age=0',
-        'DNT': '1',
-        'Sec-GPC': '1',
-    }
-    
-    # Add a random delay to avoid being rate-limited
-    time.sleep(random.uniform(1, 3))
-    
-    session = requests.Session()
-    session.headers.update(headers)
-    
-    try:
-        # Try to get the course page with timeout and retries
-        retries = 3
-        for attempt in range(retries):
-            try:
-                resp = session.get(url, timeout=15)
-                resp.raise_for_status()
-                
-                # Check if we got a valid response
-                if resp.status_code == 200 and len(resp.content) > 1000:
-                    break
-                else:
-                    raise requests.RequestException(f"Invalid response: {resp.status_code}")
-                    
-            except Exception as e:
-                if attempt < retries - 1:
-                    wait_time = (attempt + 1) * 2
-                    logger.warning(f"Request failed for {slug} (attempt {attempt+1}/{retries}): {e}. Waiting {wait_time}s...")
-                    time.sleep(wait_time)
-                    continue
-                raise
-                
-        soup = BeautifulSoup(resp.text, 'html.parser')
-
-        # Extract Open Graph metadata
-        og_data = {}
-        for meta in soup.find_all('meta', property=lambda x: x and x.startswith('og:')):
-            og_data[meta['property']] = meta.get('content', '')
-        
-        # Get title, thumbnail, and description
-        title = og_data.get('og:title', '').strip()
-        thumbnail = og_data.get('og:image', '').strip()
-        description = og_data.get('og:description', '').strip()
-        
-        # Fallback extraction if OG tags are missing
-        if not title:
-            title_tag = soup.find('title')
-            if title_tag:
-                title = title_tag.get_text().strip()
-        
-        if not description:
-            desc_meta = soup.find('meta', attrs={'name': 'description'})
-            if desc_meta:
-                description = desc_meta.get('content', '').strip()
-        
-        # If any of the key data is still missing, use reasonable defaults
-        if not title:
-            title = slug.replace('-', ' ').title()
-        if not description:
-            description = f'Learn {title} with this comprehensive course!'
-            
-        # Clean up title and description
-        title = title.replace(' | Udemy', '').strip()
-        if len(title) > 100:
-            title = title[:97] + '...'
-            
-        logger.info(f"Successfully scraped course: {slug}")
-        
-    except Exception as e:
-        logger.warning(f"Scraping Udemy failed for {slug}: {str(e)}")
-        # Use fallback values
-        title = slug.replace('-', ' ').title()
-        thumbnail = None
-        description = f'Learn {title} with this comprehensive course!'
-
-    # Close the session
-    session.close()
-
-    # Generate realistic random rating and students
-    rating = round(random.uniform(4.2, 4.9), 1)  # Higher ratings look better
-    students = random.randint(10000, 150000)      # More students look better
-
-    return title, thumbnail, description, rating, students
-
 # ─── TELEGRAM SENDER ───────────────────────────────────────
 def send_coupon():
     try:
@@ -278,15 +174,20 @@ def send_coupon():
             logger.warning("No coupon available, skipping this cycle")
             return
             
-        slug, coupon = coupon_data
+        slug = coupon_data.get('slug')
+        coupon = coupon_data.get('coupon_code')
+        title = coupon_data.get('title', slug.replace('-', ' ').title())
+        img = coupon_data.get('image_url')
+        desc = coupon_data.get('description', f'Learn {title} with this comprehensive course!')
         
         # Create redirect URL
         redirect_url = f"{BASE_REDIRECT_URL}?udemy_url=" + urllib.parse.quote(
             f"https://www.udemy.com/course/{slug}/?couponCode={coupon}", safe=''
         )
 
-        # Get course details with retry mechanism
-        title, img, desc, rating, students = fetch_course_details(slug)
+        # Generate realistic random rating and students
+        rating = round(random.uniform(4.2, 4.9), 1)  # Higher ratings look better
+        students = random.randint(10000, 150000)      # More students look better
 
         # Generate a random number for enrolls left (between 50 and 2000)
         enrolls_left = random.randint(50, 2000)
@@ -328,10 +229,12 @@ def send_coupon():
         if img and img.startswith('http'):
             payload['photo'] = img
             api_endpoint = f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
+            logger.info(f"Sending with image: {img}")
         else:
             payload['text'] = caption
             api_endpoint = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
             payload.pop('caption', None)
+            logger.info("Sending without image (no valid image URL)")
 
         # Send to Telegram with retry
         max_telegram_attempts = 3
