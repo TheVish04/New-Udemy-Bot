@@ -49,15 +49,15 @@ scheduler = BlockingScheduler(timezone="UTC")
 class CouponDatabase:
     def __init__(self):
         self.coupons = []
-        self.posted_slugs = set()  # Track slugs that have already been posted
+        self.posted_coupon_codes = set()  # Track coupon codes that have already been posted
         self.lock = threading.Lock()  # For thread safety
         self.last_successful_scrape = None
     
     def update_coupons(self, new_coupons):
         with self.lock:
-            # Filter out already posted courses
+            # Filter out already posted coupon codes
             filtered_coupons = [coupon for coupon in new_coupons 
-                              if coupon.get('slug') not in self.posted_slugs]
+                              if coupon.get('coupon_code') not in self.posted_coupon_codes]
             
             # Update our database with new coupons
             self.coupons.extend(filtered_coupons)
@@ -73,10 +73,10 @@ class CouponDatabase:
             # Get the next available coupon
             coupon = self.coupons.pop(0)
             
-            # Add the slug to posted set
-            self.posted_slugs.add(coupon.get('slug'))
+            # Add the coupon code to posted set
+            self.posted_coupon_codes.add(coupon.get('coupon_code'))
             
-            logger.info(f"Selected coupon: {coupon.get('slug')}, {len(self.coupons)} remaining")
+            logger.info(f"Selected coupon: {coupon.get('coupon_code')} for {coupon.get('slug')}, {len(self.coupons)} remaining")
             return coupon
     
     def has_enough_coupons(self):
