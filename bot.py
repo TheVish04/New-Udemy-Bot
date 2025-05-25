@@ -49,15 +49,21 @@ scheduler = BlockingScheduler(timezone="UTC")
 class CouponDatabase:
     def __init__(self):
         self.coupons = []
-        self.posted_coupon_codes = set()  # Track coupon codes that have already been posted
+        self.posted_coupon_identifiers = set()  # Track slug:couponcode combinations that have been posted
         self.lock = threading.Lock()  # For thread safety
         self.last_successful_scrape = None
     
+    def _get_coupon_identifier(self, coupon):
+        """Generate unique identifier from slug and coupon code"""
+        slug = coupon.get('slug', '')
+        coupon_code = coupon.get('coupon_code', '')
+        return f"{slug}:{coupon_code}"
+    
     def update_coupons(self, new_coupons):
         with self.lock:
-            # Filter out already posted coupon codes
+            # Filter out already posted coupon identifiers (slug:couponcode combinations)
             filtered_coupons = [coupon for coupon in new_coupons 
-                              if coupon.get('coupon_code') not in self.posted_coupon_codes]
+                              if self._get_coupon_identifier(coupon) not in self.posted_coupon_identifiers]
             
             # Update our database with new coupons
             self.coupons.extend(filtered_coupons)
@@ -73,10 +79,11 @@ class CouponDatabase:
             # Get the next available coupon
             coupon = self.coupons.pop(0)
             
-            # Add the coupon code to posted set
-            self.posted_coupon_codes.add(coupon.get('coupon_code'))
+            # Add the coupon identifier (slug:couponcode) to posted set
+            coupon_identifier = self._get_coupon_identifier(coupon)
+            self.posted_coupon_identifiers.add(coupon_identifier)
             
-            logger.info(f"Selected coupon: {coupon.get('coupon_code')} for {coupon.get('slug')}, {len(self.coupons)} remaining")
+            logger.info(f"Selected coupon: {coupon_identifier} for {coupon.get('slug')}, {len(self.coupons)} remaining")
             return coupon
     
     def has_enough_coupons(self):
@@ -243,7 +250,7 @@ def send_coupon():
                 resp.raise_for_status()
                 result = resp.json()
                 if result.get('ok'):
-                    logger.info(f"Successfully sent course card: {slug}")
+                    logger.info(f"Successfully sent course card: {slug}:{coupon}")
                     return  # Success
                 else:
                     logger.error(f"Telegram API error: {result}")
