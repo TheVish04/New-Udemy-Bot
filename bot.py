@@ -12,19 +12,27 @@ from flask import Flask
 from bs4 import BeautifulSoup
 import urllib.parse
 
-# Import our lightweight scraper module
+# Import our scraper modules
 from discudemy_scraper import DiscUdemyScraper
+from real_discount_scraper import RealDiscountScraper
 
 # ─── CONFIG ────────────────────────────────────────────────
 TOKEN             = '7918306173:AAFFIedi9d4R8XDA0AlsOin8BCfJRJeNGWE'
 CHAT_ID           = '@udemyfreecourses2080'
-SCRAPE_INTERVAL   = 1800  # Scrape every hour (in seconds)
-POST_INTERVAL     = random.randint(60, 61)  # Post every 10-15 minutes (in seconds)
+
+# Scraping intervals
+REAL_DISCOUNT_INTERVAL = 600    # Scrape Real.Discount every 10 minutes (600 seconds)
+DISCUDEMY_INTERVAL     = 1800   # Scrape DiscUdemy every 30 minutes (1800 seconds)
+POST_INTERVAL          = random.randint(60, 61)  # Post every 60-61 seconds
+
 BASE_REDIRECT_URL = 'https://udemyfreecoupons2080.blogspot.com'
 PORT              = 10000  # health-check endpoint port
-MAX_PAGES         = 5  # Increased since it's now faster without Selenium
-MAX_RETRY_ATTEMPTS = 3  # Reduced since HTTP requests are more reliable
-MIN_COUPONS_THRESHOLD = 1  # Minimum coupons needed to start posting
+
+# Scraping parameters
+REAL_DISCOUNT_MAX_PAGES = 1  # Only first page for Real.Discount
+DISCUDEMY_MAX_PAGES     = 5  # Multiple pages for DiscUdemy
+MAX_RETRY_ATTEMPTS      = 3
+MIN_COUPONS_THRESHOLD   = 1
 # ────────────────────────────────────────────────────────────
 
 # List of user agents to rotate through
@@ -51,7 +59,8 @@ class CouponDatabase:
         self.coupons = []
         self.posted_coupon_identifiers = set()  # Track slug:couponcode combinations that have been posted
         self.lock = threading.Lock()  # For thread safety
-        self.last_successful_scrape = None
+        self.last_successful_real_discount_scrape = None
+        self.last_successful_discudemy_scrape = None
     
     def _get_coupon_identifier(self, coupon):
         """Generate unique identifier from slug and coupon code"""
@@ -59,7 +68,7 @@ class CouponDatabase:
         coupon_code = coupon.get('coupon_code', '')
         return f"{slug}:{coupon_code}"
     
-    def update_coupons(self, new_coupons):
+    def update_coupons(self, new_coupons, source="unknown"):
         with self.lock:
             # Filter out already posted coupon identifiers (slug:couponcode combinations)
             filtered_coupons = [coupon for coupon in new_coupons 
@@ -67,8 +76,14 @@ class CouponDatabase:
             
             # Update our database with new coupons
             self.coupons.extend(filtered_coupons)
-            self.last_successful_scrape = datetime.now()
-            logger.info(f"Added {len(filtered_coupons)} new coupons to database. Total: {len(self.coupons)}")
+            
+            # Update last successful scrape timestamp based on source
+            if source.lower() == "real.discount":
+                self.last_successful_real_discount_scrape = datetime.now()
+            elif source.lower() == "discudemy":
+                self.last_successful_discudemy_scrape = datetime.now()
+                
+            logger.info(f"Added {len(filtered_coupons)} new coupons from {source} to database. Total: {len(self.coupons)}")
     
     def get_next_coupon(self):
         with self.lock:
@@ -111,7 +126,63 @@ def root():
 def run_health_server():
     app.run(host="0.0.0.0", port=PORT, debug=False)
 
-# ─── DISCUDEMY SCRAPER ───────────────────────────────────
+# ─── REAL.DISCOUNT SCRAPER ─────────────────────────────────
+def scrape_real_discount():
+    """Scrape Real.Discount for fresh coupons and update the database"""
+    retry_count = 0
+    base_delay = 30  # Start with 30 seconds delay between retries
+    
+    while retry_count < MAX_RETRY_ATTEMPTS:
+        scraper = None
+        try:
+            logger.info(f"Starting Real.Discount scraper for {REAL_DISCOUNT_MAX_PAGES} page(s) (attempt {retry_count + 1}/{MAX_RETRY_ATTEMPTS})")
+            
+            # Create Real.Discount scraper
+            scraper = RealDiscountScraper()
+            
+            # Add delay before scraping if retrying
+            if retry_count > 0:
+                delay = base_delay * (retry_count + 1)
+                delay = min(delay, 120)  # Cap at 2 minutes
+                logger.info(f"Waiting {delay} seconds before retry...")
+                time.sleep(delay)
+            
+            results = scraper.scrape(max_pages=REAL_DISCOUNT_MAX_PAGES)
+            
+            if not results:
+                logger.warning(f"No coupons found during Real.Discount scraping attempt {retry_count + 1}")
+                retry_count += 1
+                continue
+                
+            # Results contain full course information
+            valid_coupons = [item for item in results 
+                           if item.get('slug') and item.get('coupon_code')]
+                
+            if not valid_coupons:
+                logger.warning(f"No valid coupons extracted from Real.Discount results on attempt {retry_count + 1}")
+                retry_count += 1
+                continue
+                
+            logger.info(f"Successfully scraped {len(valid_coupons)} valid coupons from Real.Discount")
+            
+            # Update our database
+            coupon_db.update_coupons(valid_coupons, "Real.Discount")
+            return  # Success - exit the retry loop
+            
+        except Exception as e:
+            logger.error(f"Error during Real.Discount scraping attempt {retry_count + 1}: {e}", exc_info=True)
+            retry_count += 1
+        finally:
+            # Always clean up the scraper
+            if scraper:
+                try:
+                    scraper.close()
+                except Exception as e:
+                    logger.warning(f"Error closing Real.Discount scraper: {e}")
+                
+    logger.error(f"All {MAX_RETRY_ATTEMPTS} Real.Discount scraping attempts failed")
+
+# ─── DISCUDEMY SCRAPER ─────────────────────────────────────
 def scrape_discudemy():
     """Scrape DiscUdemy for fresh coupons and update the database"""
     retry_count = 0
@@ -120,7 +191,7 @@ def scrape_discudemy():
     while retry_count < MAX_RETRY_ATTEMPTS:
         scraper = None
         try:
-            logger.info(f"Starting DiscUdemy scraper for {MAX_PAGES} pages (attempt {retry_count + 1}/{MAX_RETRY_ATTEMPTS})")
+            logger.info(f"Starting DiscUdemy scraper for {DISCUDEMY_MAX_PAGES} pages (attempt {retry_count + 1}/{MAX_RETRY_ATTEMPTS})")
             
             # Create lightweight scraper (no Selenium!)
             scraper = DiscUdemyScraper(timeout=20)
@@ -132,10 +203,10 @@ def scrape_discudemy():
                 logger.info(f"Waiting {delay} seconds before retry...")
                 time.sleep(delay)
             
-            results = scraper.scrape(max_pages=MAX_PAGES)
+            results = scraper.scrape(max_pages=DISCUDEMY_MAX_PAGES)
             
             if not results:
-                logger.warning(f"No coupons found during scraping attempt {retry_count + 1}")
+                logger.warning(f"No coupons found during DiscUdemy scraping attempt {retry_count + 1}")
                 retry_count += 1
                 continue
                 
@@ -144,18 +215,18 @@ def scrape_discudemy():
                            if item.get('slug') and item.get('coupon_code')]
                 
             if not valid_coupons:
-                logger.warning(f"No valid coupons extracted from results on attempt {retry_count + 1}")
+                logger.warning(f"No valid coupons extracted from DiscUdemy results on attempt {retry_count + 1}")
                 retry_count += 1
                 continue
                 
-            logger.info(f"Successfully scraped {len(valid_coupons)} valid coupons with course info")
+            logger.info(f"Successfully scraped {len(valid_coupons)} valid coupons from DiscUdemy")
             
             # Update our database
-            coupon_db.update_coupons(valid_coupons)
+            coupon_db.update_coupons(valid_coupons, "DiscUdemy")
             return  # Success - exit the retry loop
             
         except Exception as e:
-            logger.error(f"Error during scraping attempt {retry_count + 1}: {e}", exc_info=True)
+            logger.error(f"Error during DiscUdemy scraping attempt {retry_count + 1}: {e}", exc_info=True)
             retry_count += 1
         finally:
             # Always clean up the scraper
@@ -163,9 +234,9 @@ def scrape_discudemy():
                 try:
                     scraper.close()
                 except Exception as e:
-                    logger.warning(f"Error closing scraper: {e}")
+                    logger.warning(f"Error closing DiscUdemy scraper: {e}")
                 
-    logger.error(f"All {MAX_RETRY_ATTEMPTS} scraping attempts failed")
+    logger.error(f"All {MAX_RETRY_ATTEMPTS} DiscUdemy scraping attempts failed")
 
 # ─── TELEGRAM SENDER ───────────────────────────────────────
 def send_coupon():
@@ -274,8 +345,11 @@ if __name__ == '__main__':
     threading.Thread(target=run_health_server, daemon=True).start()
     logger.info(f"Health-check listening on port {PORT}")
 
-    # 2) Run initial scraper and wait for sufficient coupons
-    logger.info("Starting initial scrape...")
+    # 2) Run initial scrapers and wait for sufficient coupons
+    logger.info("Starting initial scrape from Real.Discount...")
+    scrape_real_discount()
+    
+    logger.info("Starting initial scrape from DiscUdemy...")
     scrape_discudemy()
     
     # Wait for initial coupons before starting to post
@@ -290,6 +364,7 @@ if __name__ == '__main__':
         # Try scraping again if we don't have enough coupons
         if initial_wait_time % 300 == 0:  # Every 5 minutes
             logger.info("Retrying scrape to get more coupons...")
+            scrape_real_discount()
             scrape_discudemy()
     
     if not coupon_db.has_enough_coupons():
@@ -299,14 +374,25 @@ if __name__ == '__main__':
         logger.info(f"Initial scraping complete. Ready to start posting with {coupon_db.get_coupon_count()} coupons")
 
     # 3) Schedule the jobs
+    # Real.Discount scraper - every 10 minutes
     scheduler.add_job(
-        func=scrape_discudemy,
+        func=scrape_real_discount,
         trigger="interval",
-        seconds=SCRAPE_INTERVAL,
-        id="scraper_job",
+        seconds=REAL_DISCOUNT_INTERVAL,
+        id="real_discount_scraper_job",
         replace_existing=True
     )
     
+    # DiscUdemy scraper - every 30 minutes
+    scheduler.add_job(
+        func=scrape_discudemy,
+        trigger="interval",
+        seconds=DISCUDEMY_INTERVAL,
+        id="discudemy_scraper_job",
+        replace_existing=True
+    )
+    
+    # Poster job - every 60-61 seconds
     scheduler.add_job(
         func=send_coupon,
         trigger="interval",
@@ -315,14 +401,11 @@ if __name__ == '__main__':
         replace_existing=True
     )
 
-    logger.info(f"Scheduler configured - Scraping every {SCRAPE_INTERVAL}s, Posting every {POST_INTERVAL}s")
-    
-    # 4) Start the scheduler (this will block)
+    logger.info("Starting scheduler...")
     try:
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Bot stopped by user")
+        logger.info("Scheduler stopped")
     except Exception as e:
         logger.error(f"Scheduler error: {e}", exc_info=True)
-    finally:
-        logger.info("Bot shutdown complete")
+        raise
