@@ -22,7 +22,7 @@ SCRAPE_INTERVAL   = 60  # Scrape every hour (in seconds)
 POST_INTERVAL     = random.randint(60, 61)  # Post every 10-15 minutes (in seconds)
 BASE_REDIRECT_URL = 'https://udemyfreecoupons2080.blogspot.com'
 PORT              = 10000  # health-check endpoint port
-MAX_PAGES         = 10  # Increased since it's now faster without Selenium
+MAX_PAGES         = 5  # Increased since it's now faster without Selenium
 MAX_RETRY_ATTEMPTS = 3  # Reduced since HTTP requests are more reliable
 MIN_COUPONS_THRESHOLD = 1  # Minimum coupons needed to start posting
 # ────────────────────────────────────────────────────────────
