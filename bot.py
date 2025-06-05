@@ -18,13 +18,11 @@ from discudemy_scraper import DiscUdemyScraper
 # ─── CONFIG ────────────────────────────────────────────────
 TOKEN             = '7918306173:AAFFIedi9d4R8XDA0AlsOin8BCfJRJeNGWE'
 CHAT_ID           = '@udemyfreecourses2080'
-SCRAPE_INTERVAL   = 60  # Scrape every hour (in seconds)
-POST_INTERVAL     = random.randint(60, 61)  # Post every 10-15 minutes (in seconds)
+INITIAL_PAGES     = 10  # Initial scrape for first 10 pages
+MONITOR_INTERVAL  = 120  # Monitor first page every 2 minutes (in seconds)
 BASE_REDIRECT_URL = 'https://udemyfreecoupons2080.blogspot.com'
 PORT              = 10000  # health-check endpoint port
-MAX_PAGES         = 5  # Increased since it's now faster without Selenium
-MAX_RETRY_ATTEMPTS = 3  # Reduced since HTTP requests are more reliable
-MIN_COUPONS_THRESHOLD = 1  # Minimum coupons needed to start posting
+MAX_RETRY_ATTEMPTS = 3
 # ────────────────────────────────────────────────────────────
 
 # List of user agents to rotate through
@@ -45,57 +43,23 @@ logger    = logging.getLogger(__name__)
 scheduler = BlockingScheduler(timezone="UTC")
 # ────────────────────────────────────────────────────────────
 
-# Database to store and manage coupons
-class CouponDatabase:
+# Simple memory to track last sent course
+class CourseMemory:
     def __init__(self):
-        self.coupons = []
-        self.posted_coupon_identifiers = set()  # Track slug:couponcode combinations that have been posted
-        self.lock = threading.Lock()  # For thread safety
-        self.last_successful_scrape = None
+        self.last_sent_course_id = None  # Will store slug:coupon_code of last sent course
+        self.lock = threading.Lock()
     
-    def _get_coupon_identifier(self, coupon):
-        """Generate unique identifier from slug and coupon code"""
-        slug = coupon.get('slug', '')
-        coupon_code = coupon.get('coupon_code', '')
-        return f"{slug}:{coupon_code}"
-    
-    def update_coupons(self, new_coupons):
+    def get_last_sent_id(self):
         with self.lock:
-            # Filter out already posted coupon identifiers (slug:couponcode combinations)
-            filtered_coupons = [coupon for coupon in new_coupons 
-                              if self._get_coupon_identifier(coupon) not in self.posted_coupon_identifiers]
-            
-            # Update our database with new coupons
-            self.coupons.extend(filtered_coupons)
-            self.last_successful_scrape = datetime.now()
-            logger.info(f"Added {len(filtered_coupons)} new coupons to database. Total: {len(self.coupons)}")
+            return self.last_sent_course_id
     
-    def get_next_coupon(self):
+    def update_last_sent_id(self, course_id):
         with self.lock:
-            if not self.coupons:
-                logger.warning("No coupons available in database")
-                return None
-                
-            # Get the next available coupon
-            coupon = self.coupons.pop(0)
-            
-            # Add the coupon identifier (slug:couponcode) to posted set
-            coupon_identifier = self._get_coupon_identifier(coupon)
-            self.posted_coupon_identifiers.add(coupon_identifier)
-            
-            logger.info(f"Selected coupon: {coupon_identifier} for {coupon.get('slug')}, {len(self.coupons)} remaining")
-            return coupon
-    
-    def has_enough_coupons(self):
-        with self.lock:
-            return len(self.coupons) >= MIN_COUPONS_THRESHOLD
-    
-    def get_coupon_count(self):
-        with self.lock:
-            return len(self.coupons)
+            self.last_sent_course_id = course_id
+            logger.info(f"Updated last sent course ID to: {course_id}")
 
-# Create our coupon database
-coupon_db = CouponDatabase()
+# Create memory instance
+course_memory = CourseMemory()
 
 # ─── FLASK HEALTH CHECK ────────────────────────────────────
 app = Flask(__name__)
@@ -106,86 +70,23 @@ def healthz():
 
 @app.route("/")
 def root():
-    return "Udemy Coupon Bot is running", 404  # Return 404 as expected by logs
+    return "Udemy Coupon Bot is running", 404
 
 def run_health_server():
     app.run(host="0.0.0.0", port=PORT, debug=False)
 
-# ─── DISCUDEMY SCRAPER ───────────────────────────────────
-def scrape_discudemy():
-    """Scrape DiscUdemy for fresh coupons and update the database"""
-    retry_count = 0
-    base_delay = 30  # Start with 30 seconds delay between retries
-    
-    while retry_count < MAX_RETRY_ATTEMPTS:
-        scraper = None
-        try:
-            logger.info(f"Starting DiscUdemy scraper for {MAX_PAGES} pages (attempt {retry_count + 1}/{MAX_RETRY_ATTEMPTS})")
-            
-            # Create lightweight scraper (no Selenium!)
-            scraper = DiscUdemyScraper(timeout=20)
-            
-            # Add delay before scraping if retrying
-            if retry_count > 0:
-                delay = base_delay * (retry_count + 1)
-                delay = min(delay, 120)  # Cap at 2 minutes
-                logger.info(f"Waiting {delay} seconds before retry...")
-                time.sleep(delay)
-            
-            results = scraper.scrape(max_pages=MAX_PAGES)
-            
-            if not results:
-                logger.warning(f"No coupons found during scraping attempt {retry_count + 1}")
-                retry_count += 1
-                continue
-                
-            # Results now contain full course information
-            valid_coupons = [item for item in results 
-                           if item.get('slug') and item.get('coupon_code')]
-                
-            if not valid_coupons:
-                logger.warning(f"No valid coupons extracted from results on attempt {retry_count + 1}")
-                retry_count += 1
-                continue
-                
-            logger.info(f"Successfully scraped {len(valid_coupons)} valid coupons with course info")
-            
-            # Update our database
-            coupon_db.update_coupons(valid_coupons)
-            return  # Success - exit the retry loop
-            
-        except Exception as e:
-            logger.error(f"Error during scraping attempt {retry_count + 1}: {e}", exc_info=True)
-            retry_count += 1
-        finally:
-            # Always clean up the scraper
-            if scraper:
-                try:
-                    scraper.close()
-                except Exception as e:
-                    logger.warning(f"Error closing scraper: {e}")
-                
-    logger.error(f"All {MAX_RETRY_ATTEMPTS} scraping attempts failed")
-
 # ─── TELEGRAM SENDER ───────────────────────────────────────
-def send_coupon():
+def send_course_immediately(coupon_data):
+    """Send a single course immediately to Telegram"""
     try:
-        # Check if we have enough coupons
-        if not coupon_db.has_enough_coupons():
-            logger.warning(f"Not enough coupons available ({coupon_db.get_coupon_count()}), skipping this cycle")
-            return
-        
-        # Get the next coupon
-        coupon_data = coupon_db.get_next_coupon()
-        if not coupon_data:
-            logger.warning("No coupon available, skipping this cycle")
-            return
-            
         slug = coupon_data.get('slug')
         coupon = coupon_data.get('coupon_code')
         title = coupon_data.get('title', slug.replace('-', ' ').title())
         img = coupon_data.get('image_url')
         desc = coupon_data.get('description', f'Learn {title} with this comprehensive course!')
+        
+        # Create course identifier
+        course_id = f"{slug}:{coupon}"
         
         # Create redirect URL
         redirect_url = f"{BASE_REDIRECT_URL}?udemy_url=" + urllib.parse.quote(
@@ -193,10 +94,8 @@ def send_coupon():
         )
 
         # Generate realistic random rating and students
-        rating = round(random.uniform(3.0, 4.9), 1)  # Higher ratings look better
-        students = random.randint(100, 50000)      # More students look better
-
-        # Generate a random number for enrolls left (between 50 and 2000)
+        rating = round(random.uniform(3.0, 4.9), 1)
+        students = random.randint(100, 50000)
         enrolls_left = random.randint(50, 1000)
 
         # Format the description to a maximum of 180 characters with ellipsis
@@ -235,12 +134,10 @@ def send_coupon():
         if img and img.startswith('http'):
             payload['photo'] = img
             api_endpoint = f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
-            logger.info(f"Sending with image: {img}")
         else:
             payload['text'] = caption
             api_endpoint = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
             payload.pop('caption', None)
-            logger.info("Sending without image (no valid image URL)")
 
         # Send to Telegram with retry
         max_telegram_attempts = 3
@@ -250,23 +147,129 @@ def send_coupon():
                 resp.raise_for_status()
                 result = resp.json()
                 if result.get('ok'):
-                    logger.info(f"Successfully sent course card: {slug}:{coupon}")
-                    return  # Success
+                    logger.info(f"✅ Successfully sent course: {title} ({course_id})")
+                    # Update memory with the last sent course
+                    course_memory.update_last_sent_id(course_id)
+                    return True
                 else:
                     logger.error(f"Telegram API error: {result}")
                     if telegram_attempt < max_telegram_attempts - 1:
-                        time.sleep(3)
+                        time.sleep(2)
             except Exception as e:
                 logger.error(f"Telegram API request failed (attempt {telegram_attempt+1}/{max_telegram_attempts}): {e}")
                 if telegram_attempt < max_telegram_attempts - 1:
-                    time.sleep(3)
+                    time.sleep(2)
                     continue
         
-        # If we get here, all Telegram attempts failed
-        logger.error("All Telegram API attempts failed for this coupon")
+        logger.error(f"❌ Failed to send course after all attempts: {title}")
+        return False
                 
     except Exception as e:
-        logger.error(f"Failed to send coupon: {e}", exc_info=True)
+        logger.error(f"Failed to send course: {e}", exc_info=True)
+        return False
+
+# ─── SCRAPING FUNCTIONS ────────────────────────────────────
+def scrape_and_send_initial_courses():
+    """Scrape first 10 pages and send all courses immediately"""
+    logger.info(f"Starting initial scrape of {INITIAL_PAGES} pages...")
+    
+    scraper = None
+    try:
+        scraper = DiscUdemyScraper(timeout=20)
+        results = scraper.scrape(max_pages=INITIAL_PAGES)
+        
+        if not results:
+            logger.warning("No courses found during initial scraping")
+            return
+        
+        logger.info(f"Found {len(results)} courses in initial scrape. Sending immediately...")
+        
+        sent_count = 0
+        for coupon_data in results:
+            if coupon_data.get('slug') and coupon_data.get('coupon_code'):
+                # Send immediately
+                if send_course_immediately(coupon_data):
+                    sent_count += 1
+                    # Small delay to avoid rate limiting
+                    time.sleep(1)
+                else:
+                    logger.warning(f"Failed to send course: {coupon_data.get('slug')}")
+        
+        logger.info(f"Initial scrape complete. Sent {sent_count} out of {len(results)} courses")
+        
+    except Exception as e:
+        logger.error(f"Error during initial scraping: {e}", exc_info=True)
+    finally:
+        if scraper:
+            try:
+                scraper.close()
+            except Exception as e:
+                logger.warning(f"Error closing scraper: {e}")
+
+def monitor_first_page():
+    """Monitor first page for new courses and send them immediately"""
+    logger.info("Monitoring first page for new courses...")
+    
+    scraper = None
+    try:
+        scraper = DiscUdemyScraper(timeout=20)
+        results = scraper.scrape(max_pages=1)  # Only scrape first page
+        
+        if not results:
+            logger.info("No courses found on first page")
+            return
+        
+        last_sent_id = course_memory.get_last_sent_id()
+        logger.info(f"Found {len(results)} courses on first page. Last sent ID: {last_sent_id}")
+        
+        # Find new courses (courses that come after the last sent one)
+        new_courses = []
+        if last_sent_id is None:
+            # If no previous course, send all
+            new_courses = results
+        else:
+            # Find courses that come after the last sent course
+            found_last_sent = False
+            for coupon_data in results:
+                course_id = f"{coupon_data.get('slug')}:{coupon_data.get('coupon_code')}"
+                if course_id == last_sent_id:
+                    found_last_sent = True
+                    continue
+                if not found_last_sent:
+                    # This course is newer than the last sent one
+                    new_courses.append(coupon_data)
+            
+            # If we didn't find the last sent course, it means all courses are new
+            if not found_last_sent:
+                logger.info("Last sent course not found on first page, all courses are considered new")
+                new_courses = results
+        
+        if new_courses:
+            logger.info(f"Found {len(new_courses)} new courses. Sending immediately...")
+            sent_count = 0
+            
+            # Send new courses in reverse order (newest first)
+            for coupon_data in reversed(new_courses):
+                if coupon_data.get('slug') and coupon_data.get('coupon_code'):
+                    if send_course_immediately(coupon_data):
+                        sent_count += 1
+                        # Small delay to avoid rate limiting
+                        time.sleep(1)
+                    else:
+                        logger.warning(f"Failed to send new course: {coupon_data.get('slug')}")
+            
+            logger.info(f"Sent {sent_count} new courses")
+        else:
+            logger.info("No new courses found on first page")
+        
+    except Exception as e:
+        logger.error(f"Error during first page monitoring: {e}", exc_info=True)
+    finally:
+        if scraper:
+            try:
+                scraper.close()
+            except Exception as e:
+                logger.warning(f"Error closing scraper: {e}")
 
 # ─── MAIN ───────────────────────────────────────────────────
 if __name__ == '__main__':
@@ -274,48 +277,19 @@ if __name__ == '__main__':
     threading.Thread(target=run_health_server, daemon=True).start()
     logger.info(f"Health-check listening on port {PORT}")
 
-    # 2) Run initial scraper and wait for sufficient coupons
-    logger.info("Starting initial scrape...")
-    scrape_discudemy()
+    # 2) Run initial scrape and send all courses from first 10 pages
+    scrape_and_send_initial_courses()
     
-    # Wait for initial coupons before starting to post
-    initial_wait_time = 0
-    max_initial_wait = 900  # Wait up to 15 minutes for first coupons
-    
-    while not coupon_db.has_enough_coupons() and initial_wait_time < max_initial_wait:
-        logger.info(f"Waiting for sufficient coupons... Current: {coupon_db.get_coupon_count()}, Need: {MIN_COUPONS_THRESHOLD}")
-        time.sleep(60)  # Wait 1 minute
-        initial_wait_time += 60
-        
-        # Try scraping again if we don't have enough coupons
-        if initial_wait_time % 300 == 0:  # Every 5 minutes
-            logger.info("Retrying scrape to get more coupons...")
-            scrape_discudemy()
-    
-    if not coupon_db.has_enough_coupons():
-        logger.error(f"Could not get enough coupons after {max_initial_wait} seconds. Current: {coupon_db.get_coupon_count()}")
-        # Continue anyway - the scheduled scrapes might get more coupons
-    else:
-        logger.info(f"Initial scraping complete. Ready to start posting with {coupon_db.get_coupon_count()} coupons")
-
-    # 3) Schedule the jobs
+    # 3) Schedule monitoring job for first page every 2 minutes
     scheduler.add_job(
-        func=scrape_discudemy,
+        func=monitor_first_page,
         trigger="interval",
-        seconds=SCRAPE_INTERVAL,
-        id="scraper_job",
-        replace_existing=True
-    )
-    
-    scheduler.add_job(
-        func=send_coupon,
-        trigger="interval",
-        seconds=POST_INTERVAL,
-        id="poster_job",
+        seconds=MONITOR_INTERVAL,
+        id="monitor_job",
         replace_existing=True
     )
 
-    logger.info(f"Scheduler configured - Scraping every {SCRAPE_INTERVAL}s, Posting every {POST_INTERVAL}s")
+    logger.info(f"Scheduler configured - Monitoring first page every {MONITOR_INTERVAL} seconds")
     
     # 4) Start the scheduler (this will block)
     try:
