@@ -84,14 +84,22 @@ def send_course_immediately(coupon_data):
         title = coupon_data.get('title', slug.replace('-', ' ').title())
         img = coupon_data.get('image_url')
         desc = coupon_data.get('description', f'Learn {title} with this comprehensive course!')
+        is_free = coupon_data.get('is_free', False)
         
         # Create course identifier
         course_id = f"{slug}:{coupon}"
         
-        # Create redirect URL
-        redirect_url = f"{BASE_REDIRECT_URL}?udemy_url=" + urllib.parse.quote(
-            f"https://www.udemy.com/course/{slug}/?couponCode={coupon}", safe=''
-        )
+        # Create redirect URL - handle free courses differently
+        if is_free or coupon == "FREE":
+            # For free courses, link directly to the course without coupon code
+            redirect_url = f"{BASE_REDIRECT_URL}?udemy_url=" + urllib.parse.quote(
+                f"https://www.udemy.com/course/{slug}/", safe=''
+            )
+        else:
+            # For coupon courses, include the coupon code
+            redirect_url = f"{BASE_REDIRECT_URL}?udemy_url=" + urllib.parse.quote(
+                f"https://www.udemy.com/course/{slug}/?couponCode={coupon}", safe=''
+            )
 
         # Generate realistic random rating and students
         rating = round(random.uniform(3.0, 4.9), 1)
@@ -109,14 +117,25 @@ def send_course_immediately(coupon_data):
         # Clean up title to prevent HTML parsing issues
         title = title.replace("<", "&lt;").replace(">", "&gt;").replace("&", "&amp;")
         
-        caption = (
-            f"✏️ <b>{title}</b>\n\n"
-            f"⏰ LIMITED TIME ({enrolls_left_text} Enrolls Left)\n"
-            f"⭐ {rating_text}\n"
-            f"👩‍🎓 {students_text} students\n"
-            f"🌐 English Language\n\n"
-            f"💡 {short_desc}"
-        )
+        # Different caption for free vs coupon courses
+        if is_free or coupon == "FREE":
+            caption = (
+                f"✏️ <b>{title}</b>\n\n"
+                f"🆓 ALWAYS FREE COURSE\n"
+                f"⭐ {rating_text}\n"
+                f"👩‍🎓 {students_text} students\n"
+                f"🌐 English Language\n\n"
+                f"💡 {short_desc}"
+            )
+        else:
+            caption = (
+                f"✏️ <b>{title}</b>\n\n"
+                f"⏰ LIMITED TIME ({enrolls_left_text} Enrolls Left)\n"
+                f"⭐ {rating_text}\n"
+                f"👩‍🎓 {students_text} students\n"
+                f"🌐 English Language\n\n"
+                f"💡 {short_desc}"
+            )
 
         payload = {
             'chat_id':    CHAT_ID,
@@ -124,7 +143,7 @@ def send_course_immediately(coupon_data):
             'parse_mode': 'HTML',
             'reply_markup': json.dumps({
                 'inline_keyboard': [[{
-                    'text': '🎓 Get Free Course',
+                    'text': '🎓 Get Free Course' if is_free or coupon == "FREE" else '🎓 Get Free Course',
                     'url':  redirect_url
                 }]]
             })
@@ -147,7 +166,8 @@ def send_course_immediately(coupon_data):
                 resp.raise_for_status()
                 result = resp.json()
                 if result.get('ok'):
-                    logger.info(f"✅ Successfully sent course: {title} ({course_id})")
+                    course_type = "free" if is_free or coupon == "FREE" else "coupon"
+                    logger.info(f"✅ Successfully sent {course_type} course: {title} ({course_id})")
                     # Update memory with the last sent course
                     course_memory.update_last_sent_id(course_id)
                     return True

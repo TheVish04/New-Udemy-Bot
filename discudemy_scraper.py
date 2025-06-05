@@ -139,7 +139,7 @@ class DiscUdemyScraper:
                 
                 if 'go' in go_params:
                     possible_udemy_url = go_params['go'][0]
-                    if 'udemy.com/course' in possible_udemy_url and 'couponCode=' in possible_udemy_url:
+                    if 'udemy.com/course' in possible_udemy_url:
                         result = self._parse_udemy_url(possible_udemy_url, detail_url, go_link)
                         if result:
                             result.update(course_info)
@@ -166,19 +166,29 @@ class DiscUdemyScraper:
                 # Method 2: Look in the page source with regex
                 if not udemy_link:
                     page_text = go_response.text
+                    # Look for URLs with coupon codes first
                     udemy_matches = re.findall(r'https://www\.udemy\.com/course/[^"\'>\s]+couponCode=[^"\'>\s]+', page_text)
                     if udemy_matches:
                         udemy_link = udemy_matches[0]
+                    else:
+                        # If no coupon code, look for regular course URLs
+                        udemy_matches = re.findall(r'https://www\.udemy\.com/course/[^"\'>\s]+', page_text)
+                        if udemy_matches:
+                            udemy_link = udemy_matches[0]
                 
                 # Method 3: Look for any Udemy course URL and try to construct coupon URL
                 if not udemy_link:
                     course_matches = re.findall(r'https://www\.udemy\.com/course/([^/"\'>\s]+)', page_text)
                     coupon_matches = re.findall(r'couponCode=([^"\'>\s&]+)', page_text)
                     
-                    if course_matches and coupon_matches:
+                    if course_matches:
                         slug = course_matches[0]
-                        code = coupon_matches[0]
-                        udemy_link = f"https://www.udemy.com/course/{slug}/?couponCode={code}"
+                        if coupon_matches:
+                            code = coupon_matches[0]
+                            udemy_link = f"https://www.udemy.com/course/{slug}/?couponCode={code}"
+                        else:
+                            # No coupon code found, course might be free
+                            udemy_link = f"https://www.udemy.com/course/{slug}/"
                 
                 if udemy_link:
                     result = self._parse_udemy_url(udemy_link, detail_url, go_link)
@@ -198,7 +208,7 @@ class DiscUdemyScraper:
             return None
     
     def _parse_udemy_url(self, udemy_url, detail_url, go_link):
-        """Parse Udemy URL to extract slug and coupon code"""
+        """Parse Udemy URL to extract slug and coupon code (if present)"""
         try:
             parsed = urlparse(udemy_url)
             
@@ -213,22 +223,35 @@ class DiscUdemyScraper:
             else:
                 slug = path_parts[-1] if path_parts else None
             
-            # Extract coupon code from query parameters
+            # Extract coupon code from query parameters (if present)
             query_params = parse_qs(parsed.query)
             code = query_params.get("couponCode", [""])[0]
             
-            if not slug or not code:
-                logger.warning(f"Missing slug ({slug}) or coupon code ({code}) from {udemy_url}")
+            if not slug:
+                logger.warning(f"Missing slug from {udemy_url}")
                 return None
             
-            logger.info(f"Extracted coupon - Slug: {slug}, Code: {code}")
-            return {
-                "detail_url": detail_url,
-                "go_link": go_link,
-                "udemy_url": udemy_url,
-                "slug": slug,
-                "coupon_code": code
-            }
+            # Handle free courses (no coupon code)
+            if not code:
+                logger.info(f"Free course detected - Slug: {slug} (no coupon code)")
+                return {
+                    "detail_url": detail_url,
+                    "go_link": go_link,
+                    "udemy_url": udemy_url,
+                    "slug": slug,
+                    "coupon_code": "FREE",  # Use "FREE" as identifier for free courses
+                    "is_free": True
+                }
+            else:
+                logger.info(f"Coupon course - Slug: {slug}, Code: {code}")
+                return {
+                    "detail_url": detail_url,
+                    "go_link": go_link,
+                    "udemy_url": udemy_url,
+                    "slug": slug,
+                    "coupon_code": code,
+                    "is_free": False
+                }
             
         except Exception as e:
             logger.error(f"Error parsing Udemy URL {udemy_url}: {e}")
@@ -265,7 +288,11 @@ class DiscUdemyScraper:
                                     coupon_info['description'] = f"Learn {coupon_info['title']} with this comprehensive course!"
                                 
                                 page_results.append(coupon_info)
-                                logger.info(f"✅ Successfully extracted: {coupon_info['slug']}")
+                                
+                                if coupon_info.get('is_free'):
+                                    logger.info(f"✅ Successfully extracted free course: {coupon_info['slug']}")
+                                else:
+                                    logger.info(f"✅ Successfully extracted coupon course: {coupon_info['slug']}")
                             else:
                                 logger.warning(f"❌ Failed to extract valid coupon from {detail_url}")
                             
@@ -280,7 +307,7 @@ class DiscUdemyScraper:
                             continue
                     
                     results.extend(page_results)
-                    logger.info(f"Page {page_num} complete. Got {len(page_results)} valid coupons")
+                    logger.info(f"Page {page_num} complete. Got {len(page_results)} valid courses")
                     
                     # Delay between pages (only if processing multiple pages)
                     if page_num < max_pages and max_pages > 1:
@@ -295,5 +322,5 @@ class DiscUdemyScraper:
         finally:
             self.close()
         
-        logger.info(f"Scraping complete. Retrieved {len(results)} valid coupons from {max_pages} page(s)")
+        logger.info(f"Scraping complete. Retrieved {len(results)} valid courses from {max_pages} page(s)")
         return results
