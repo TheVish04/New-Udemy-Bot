@@ -42,7 +42,7 @@ class DiscUdemyScraper:
         
         try:
             # Add random delay to avoid rate limiting
-            time.sleep(random.uniform(1, 3))
+            time.sleep(random.uniform(1, 2))
             
             response = self.session.get(url, timeout=self.timeout)
             response.raise_for_status()
@@ -66,80 +66,26 @@ class DiscUdemyScraper:
                     if '/go/' not in href and href.startswith(self.BASE):
                         urls.append(href)
             
-            # Remove duplicates
-            urls = list(set(urls))
-            logger.info(f"Page {page_num}: Found {len(urls)} detail URLs")
-            return urls
+            # Remove duplicates while preserving order
+            seen = set()
+            unique_urls = []
+            for url in urls:
+                if url not in seen:
+                    seen.add(url)
+                    unique_urls.append(url)
+            
+            logger.info(f"Page {page_num}: Found {len(unique_urls)} detail URLs")
+            return unique_urls
             
         except Exception as e:
             logger.error(f"Error loading listing page {page_num}: {e}")
             return []
     
-    def extract_course_info_from_listing(self, page_num: int):
-        """Extract course information directly from listing page"""
-        url = f"{self.BASE}{self.LISTING.format(page_num)}"
-        
-        try:
-            time.sleep(random.uniform(1, 3))
-            response = self.session.get(url, timeout=self.timeout)
-            response.raise_for_status()
-            
-            soup = BeautifulSoup(response.content, 'html.parser')
-            courses = []
-            
-            # Find all course cards
-            course_cards = soup.find_all('article', class_='ui four stackable cards m15')
-            
-            for card in course_cards:
-                sections = card.find_all('section', class_='card')
-                
-                for section in sections:
-                    try:
-                        course_info = {}
-                        
-                        # Extract title from the card header link
-                        header_link = section.find('a', class_='card-header')
-                        if header_link:
-                            course_info['detail_url'] = urljoin(self.BASE, header_link.get('href', ''))
-                            course_info['title'] = header_link.get_text(strip=True)
-                        
-                        # Extract image
-                        content_div = section.find('div', class_='content')
-                        if content_div:
-                            # Look for amp-img or img tags
-                            img_tags = content_div.find_all(['amp-img', 'img'])
-                            for img in img_tags:
-                                if img.get('src') and ('udemy' in img.get('src', '') or 'img-c' in img.get('src', '')):
-                                    course_info['image_url'] = img.get('src')
-                                    break
-                            
-                            # Extract description from meta div
-                            meta_div = content_div.find('div', class_='meta')
-                            if meta_div:
-                                course_info['description'] = meta_div.get_text(strip=True)
-                        
-                        # Only process if we have essential information
-                        if course_info.get('detail_url') and course_info.get('title'):
-                            courses.append(course_info)
-                            
-                    except Exception as e:
-                        logger.warning(f"Error extracting course info from card: {e}")
-                        continue
-            
-            logger.info(f"Page {page_num}: Extracted info for {len(courses)} courses")
-            return courses
-            
-        except Exception as e:
-            logger.error(f"Error extracting course info from page {page_num}: {e}")
-            return []
-    
     def extract_coupon(self, detail_url: str):
         """Extract coupon information from course detail page"""
-        logger.info(f"Processing detail URL: {detail_url}")
-        
         try:
             # Add delay between requests
-            time.sleep(random.uniform(2, 4))
+            time.sleep(random.uniform(1, 2))
             
             response = self.session.get(detail_url, timeout=self.timeout)
             response.raise_for_status()
@@ -196,14 +142,14 @@ class DiscUdemyScraper:
                     if 'udemy.com/course' in possible_udemy_url and 'couponCode=' in possible_udemy_url:
                         result = self._parse_udemy_url(possible_udemy_url, detail_url, go_link)
                         if result:
-                            result.update(course_info)  # Add course info to result
+                            result.update(course_info)
                             return result
             except Exception as e:
                 logger.debug(f"Direct URL parsing failed: {e}")
             
             # If direct extraction failed, follow the go_link
             try:
-                time.sleep(random.uniform(1, 2))
+                time.sleep(random.uniform(0.5, 1))
                 go_response = self.session.get(go_link, timeout=self.timeout)
                 go_response.raise_for_status()
                 
@@ -237,7 +183,7 @@ class DiscUdemyScraper:
                 if udemy_link:
                     result = self._parse_udemy_url(udemy_link, detail_url, go_link)
                     if result:
-                        result.update(course_info)  # Add course info to result
+                        result.update(course_info)
                         return result
                 else:
                     logger.warning(f"No Udemy link found in go page for {detail_url}")
@@ -288,20 +234,29 @@ class DiscUdemyScraper:
             logger.error(f"Error parsing Udemy URL {udemy_url}: {e}")
             return None
     
-    def scrape(self, max_pages=5, delay_range=(2, 5)):
+    def scrape(self, max_pages=5, delay_range=(1, 2)):
         """Scrape coupons from multiple pages with course information from DiscUdemy"""
         results = []
         
         try:
             for page_num in range(1, max_pages + 1):
                 try:
+                    logger.info(f"Processing page {page_num}/{max_pages}")
+                    
                     # Get detail URLs for this page
                     detail_urls = self.get_detail_urls(page_num)
                     
+                    if not detail_urls:
+                        logger.warning(f"No detail URLs found on page {page_num}")
+                        continue
+                    
                     # Process each detail URL
-                    for detail_url in detail_urls:
+                    page_results = []
+                    for i, detail_url in enumerate(detail_urls):
                         try:
+                            logger.info(f"Processing course {i+1}/{len(detail_urls)} on page {page_num}")
                             coupon_info = self.extract_coupon(detail_url)
+                            
                             if coupon_info and coupon_info.get('slug') and coupon_info.get('coupon_code'):
                                 # Ensure we have at least basic course info
                                 if not coupon_info.get('title'):
@@ -309,18 +264,27 @@ class DiscUdemyScraper:
                                 if not coupon_info.get('description'):
                                     coupon_info['description'] = f"Learn {coupon_info['title']} with this comprehensive course!"
                                 
-                                results.append(coupon_info)
+                                page_results.append(coupon_info)
+                                logger.info(f"✅ Successfully extracted: {coupon_info['slug']}")
+                            else:
+                                logger.warning(f"❌ Failed to extract valid coupon from {detail_url}")
                             
-                            # Random delay between requests
-                            time.sleep(random.uniform(*delay_range))
+                            # Random delay between requests (shorter for single page monitoring)
+                            if max_pages == 1:
+                                time.sleep(random.uniform(0.5, 1))  # Faster for single page
+                            else:
+                                time.sleep(random.uniform(*delay_range))
                             
                         except Exception as e:
                             logger.error(f"Error processing {detail_url}: {e}")
                             continue
                     
-                    # Delay between pages
-                    if page_num < max_pages:
-                        time.sleep(random.uniform(3, 7))
+                    results.extend(page_results)
+                    logger.info(f"Page {page_num} complete. Got {len(page_results)} valid coupons")
+                    
+                    # Delay between pages (only if processing multiple pages)
+                    if page_num < max_pages and max_pages > 1:
+                        time.sleep(random.uniform(2, 4))
                         
                 except Exception as e:
                     logger.error(f"Error processing page {page_num}: {e}")
@@ -331,5 +295,5 @@ class DiscUdemyScraper:
         finally:
             self.close()
         
-        logger.info(f"Scraping complete. Retrieved {len(results)} valid coupons")
+        logger.info(f"Scraping complete. Retrieved {len(results)} valid coupons from {max_pages} page(s)")
         return results
