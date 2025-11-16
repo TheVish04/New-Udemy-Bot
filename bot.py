@@ -19,7 +19,7 @@ CHAT_ID  = os.environ["CHANNEL_ID"]
 PORT     = int(os.environ.get("PORT", 10000))
 SHRINKME_API_KEY = os.environ["SHRINKME_API_KEY"]
 
-INITIAL_PAGES    = 10     # scrape at startup
+INITIAL_PAGES    = 3     # scrape at startup
 MONITOR_INTERVAL = 120    # check page 1 every 2 minutes
 
 # ───────────────────────────────────────────────────────────
