@@ -70,7 +70,7 @@ def healthz():
 
 def start_scheduler():
     sched = BackgroundScheduler()
-    sched.add_job(job_scrape, "interval", minutes=15)
+    sched.add_job(job_scrape, "interval", minutes=4)
     sched.start()
     return sched
 
