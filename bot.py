@@ -18,7 +18,7 @@ CHAT_ID  = os.environ["CHANNEL_ID"]
 PORT     = int(os.environ.get("PORT", 10000))
 SHRINKME_API_KEY = os.environ["SHRINKME_API_KEY"]
 
-INITIAL_PAGES    = 4      # send all courses from 10 pages once
+INITIAL_PAGES    = 197      # send all courses from 10 pages once
 MONITOR_INTERVAL = 120     # check page 1 every 2 minutes
 
 # ───────────────────────────────────────────────────────────
