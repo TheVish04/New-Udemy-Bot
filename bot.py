@@ -1,10 +1,10 @@
 # bot.py
 """
 Unified Udemy coupon bot
-- Scrapers: couponscorpion -> discudemy
-- Separate last_sent IDs
-- Uses ShrinkMe shortener
-- Health endpoint + scheduler
+Scrapers: CouponScorpion → DiscUdemy
+Beautiful Telegram card format (same as screenshot)
+Random rating, students, language, enrolls left
+Health endpoint + scheduler
 """
 
 import os
@@ -14,10 +14,12 @@ import time
 import random
 import logging
 from pathlib import Path
+
 import requests
 from flask import Flask
 from apscheduler.schedulers.background import BackgroundScheduler
 
+# ---- SCRAPERS ----
 from discudemy_scraper import DiscUdemyScraper
 from couponscorpion_scraper import CouponScorpionScraper
 
@@ -28,30 +30,25 @@ CHANNEL_ID = os.getenv("CHANNEL_ID")
 SHRINKME_API_KEY = os.getenv("SHRINKME_API_KEY")
 PORT = int(os.getenv("PORT", "10000"))
 
-# monitor every 60 sec
 MONITOR_INTERVAL_SECONDS = int(os.getenv("MONITOR_INTERVAL_SECONDS", "60"))
 
-# no initial limits
 INITIAL_SEND_LIMIT = {
     "couponscorpion": None,
-    "discudemy": None,
+    "discudemy": None,   # None → send all on first run
 }
-
-# use only page 1 everywhere
-COUPONSCORP_PAGES = 1
-DISCUD_PAGES = 1
 
 DATA_DIR = Path("data")
 LAST_SENT_FILE = DATA_DIR / "last_sent.json"
+
 REQUEST_TIMEOUT = 15
 SHORTENER_RETRIES = 3
 
 # Logging
 logging.basicConfig(
     format="%(asctime)s — %(levelname)s — %(message)s",
-    level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
+    level=getattr(logging, LOG_LEVEL.upper(), logging.INFO)
 )
-logger = logging.getLogger("udemy-bot")
+logger = logging.getLogger("bot")
 
 # ---------------------- last_sent storage ----------------------
 DATA_DIR.mkdir(exist_ok=True)
@@ -72,49 +69,63 @@ def save_last_sent(obj):
     except:
         pass
 
-# ---------------------- Shortener ----------------------
+# ---------------------- SHORTENER ----------------------
 class ShrinkMe:
     def __init__(self, api_key):
         self.api_key = api_key
-        self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "UdemyCouponBot/1.0"})
+        self.s = requests.Session()
+        self.s.headers.update({"User-Agent": "UdemyBot/1.0"})
 
-    def shorten(self, url):
+    def shorten(self, long_url):
         if not self.api_key:
-            return url
+            return long_url
 
-        api_url = "https://shrinkme.io/api"
-        params = {"api": self.api_key, "url": url, "format": "json"}
+        url = "https://shrinkme.io/api"
+        params = {"api": self.api_key, "url": long_url, "format": "json"}
 
-        for attempt in range(SHORTENER_RETRIES):
+        for _ in range(3):
             try:
-                r = self.session.get(api_url, params=params, timeout=REQUEST_TIMEOUT)
-                data = r.json()
-                short = data.get("shortenedUrl") or data.get("url")
+                r = self.s.get(url, params=params, timeout=REQUEST_TIMEOUT)
+                d = r.json()
+                short = d.get("shortenedUrl") or d.get("url")
                 if short:
                     return short.replace("\\/", "/")
             except:
                 time.sleep(1)
 
-        return url
+        return long_url
 
 shortener = ShrinkMe(SHRINKME_API_KEY)
 
-# ---------------------- Telegram sender ----------------------
+# ---------------------- TELEGRAM SENDER ----------------------
+def generate_random_stats():
+    return {
+        "enrolls_left": random.randint(200, 900),
+        "rating": round(random.uniform(4.1, 4.8), 1),
+        "students": random.randint(5000, 40000),
+        "language": "English"
+    }
+
 def send_to_telegram(course):
     try:
         title = course.get("title") or "Course"
-        desc = course.get("description") or ""
+        description = course.get("description") or "Get this amazing course now!"
         image = course.get("image_url")
         udemy_url = course.get("udemy_url") or course.get("post_url")
 
         short = shortener.shorten(udemy_url)
-        short_desc = (desc[:200] + "...") if len(desc) > 200 else desc
+
+        # -------- RANDOM STATS --------
+        stats = generate_random_stats()
 
         caption = (
-            f"🎁 *{title}*\n\n"
-            f"{short_desc}\n\n"
-            f"👉 Access Course:\n{short}"
+            f"🎓 *{title}*\n\n"
+            f"⏳ LIMITED TIME ({stats['enrolls_left']} Enrolls Left)\n"
+            f"⭐ {stats['rating']}/5\n"
+            f"👩‍🎓 {stats['students']:,} students\n"
+            f"🌐 {stats['language']} Language\n\n"
+            f"💡 {description}\n\n"
+            f"👉 *Get Free Course:* {short}"
         )
 
         reply_markup = {
@@ -122,32 +133,33 @@ def send_to_telegram(course):
         }
 
         if image:
-            endpoint = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
             payload = {
                 "chat_id": CHANNEL_ID,
                 "photo": image,
                 "caption": caption,
                 "parse_mode": "Markdown",
-                "reply_markup": json.dumps(reply_markup),
+                "reply_markup": json.dumps(reply_markup)
             }
+            endpoint = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
         else:
-            endpoint = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
             payload = {
                 "chat_id": CHANNEL_ID,
                 "text": caption,
                 "parse_mode": "Markdown",
-                "reply_markup": json.dumps(reply_markup),
+                "reply_markup": json.dumps(reply_markup)
             }
+            endpoint = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
         r = requests.post(endpoint, data=payload, timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
+        logger.info(f"Posted: {title}")
         return True
 
     except Exception as e:
         logger.error(f"Telegram send failed: {e}")
         return False
 
-# ---------------------- Helpers ----------------------
+# ---------------------- NEW ITEM DETECTION ----------------------
 def make_course_id(source, slug, coupon_code):
     return f"{source}|{slug}:{coupon_code}"
 
@@ -156,7 +168,7 @@ def find_new_items(items, last_sent_id, source):
         return []
 
     if last_sent_id is None:
-        return list(reversed(items))  # all items on first run
+        return list(reversed(items))  # all items first run
 
     new_items = []
     for item in items:
@@ -167,69 +179,67 @@ def find_new_items(items, last_sent_id, source):
 
     return list(reversed(new_items))
 
-# ---------------------- Process source ----------------------
-def process_source(scraper_obj, source_name):
+# ---------------------- PROCESS SOURCE ----------------------
+def process_source(scraper, source_name):
     logger.info(f"[{source_name}] Starting scrape (last_sent={last_sent_state.get(source_name)})")
 
     try:
-        # Corrected: DiscUdemy uses max_pages, CouponScorpion uses max_posts
-        if source_name == "couponscorpion":
-            items = scraper_obj.scrape(max_posts=12)
+        if source_name == "discudemy":
+            items = scraper.scrape(max_pages=1)
         else:
-            items = scraper_obj.scrape(max_pages=1)
+            items = scraper.scrape(max_posts=12)
 
     except Exception as e:
-        logger.error(f"[{source_name}] Scrape failed: {e}")
+        logger.error(f"[{source_name}] scrape error: {e}")
         return
 
     if not items:
-        logger.info(f"[{source_name}] No items returned")
+        logger.info(f"[{source_name}] No items found")
         return
 
     new_items = find_new_items(items, last_sent_state.get(source_name), source_name)
+
     if not new_items:
-        logger.info(f"[{source_name}] No new items to send")
+        logger.info(f"[{source_name}] No new items")
         return
 
-    for course in new_items:
-        if send_to_telegram(course):
-            cid = make_course_id(source_name, course.get("slug"), course.get("coupon_code"))
+    for item in new_items:
+        if send_to_telegram(item):
+            cid = make_course_id(source_name, item.get("slug"), item.get("coupon_code"))
             last_sent_state[source_name] = cid
             save_last_sent(last_sent_state)
 
         time.sleep(random.uniform(1, 2))
 
-# ---------------------- Master job ----------------------
+# ---------------------- MAIN JOB ----------------------
 def job_scrape_all():
     logger.info("====== job_scrape_all START ======")
 
-    # CouponScorpion first
     cs = CouponScorpionScraper()
     process_source(cs, "couponscorpion")
     cs.close()
 
-    # DiscUdemy second
     dd = DiscUdemyScraper()
     process_source(dd, "discudemy")
     dd.close()
 
     logger.info("====== job_scrape_all END ======")
 
-# ---------------------- Flask health ----------------------
+# ---------------------- HEALTH ENDPOINT ----------------------
 app = Flask(__name__)
 
 @app.route("/healthz")
 def healthz():
     return "OK", 200
 
-# ---------------------- Startup ----------------------
+# ---------------------- STARTUP ----------------------
 last_sent_state = load_last_sent()
-for key in ("couponscorpion", "discudemy"):
-    last_sent_state.setdefault(key, None)
+for k in ("couponscorpion", "discudemy"):
+    last_sent_state.setdefault(k, None)
 
 def start_bot():
-    logger.info(f"Health endpoint running on port {PORT}")
-    logger.info("🔎 Initial scrape started — CouponScorpion then DiscUdemy")
+    logger.info(f"Health endpoint on port {PORT}")
+    logger.info("Initial scrape running…")
 
     job_scrape_all()
 
