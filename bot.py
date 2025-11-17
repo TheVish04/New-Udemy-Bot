@@ -1,10 +1,8 @@
 # bot.py
 """
-Unified Udemy coupon bot
-- Scrapers run in order: realdiscount -> couponscorpion -> discudemy
-- Each source keeps its own last_sent ID stored in data/last_sent.json
-- ShrinkMe link shortener used for Telegram links
-- Health endpoint + scheduler
+Final corrected bot.py - Version 2 (rich Telegram cards)
+Order: RealDiscount -> CouponScorpion -> DiscUdemy
+Each source uses its own last_sent ID stored in data/last_sent.json
 """
 
 import os
@@ -15,345 +13,376 @@ import random
 import logging
 import threading
 from pathlib import Path
-from urllib.parse import quote
+from datetime import datetime
+from urllib.parse import quote_plus
 
 import requests
 from flask import Flask
 from apscheduler.schedulers.background import BackgroundScheduler
 
-# Import scrapers (make sure these modules exist in repo)
-# - discudemy_scraper.py (provided by you)
-# - realdiscount_scraper.py (I gave earlier)
-# - couponscorpion_scraper.py (assumed present)
-from discudemy_scraper import DiscUdemyScraper
+# scrapers - ensure these modules exist in repo
 from realdiscount_scraper import RealDiscountScraper
-from couponscorpion_scraper import CouponScorpionScraper  # ensure this file exists
+from couponscorpion_scraper import CouponScorpionScraper
+from discudemy_scraper import DiscUdemyScraper
 
-# ---------------------- CONFIG ----------------------
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-BOT_TOKEN = os.getenv("BOT_TOKEN")                # required
-CHANNEL_ID = os.getenv("CHANNEL_ID")              # required (channel username or chat id)
-SHRINKME_API_KEY = os.getenv("SHRINKME_API_KEY")  # required
+# shortener (your shortener.py with ShrinkMe class)
+from shortener import ShrinkMe
+
+# -------------------- CONFIG --------------------
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()
+SHRINKME_API_KEY = os.getenv("SHRINKME_API_KEY", "").strip()
 PORT = int(os.getenv("PORT", "10000"))
 
-# How many items to send on first run if no last_sent exists for that source
+# Monitoring / initial run settings
+MONITOR_INTERVAL_SECONDS = int(os.getenv("MONITOR_INTERVAL_SECONDS", str(4 * 60)))  # default 4 minutes
 INITIAL_SEND_LIMIT = {
-    "realdiscount": int(os.getenv("INIT_REALDISCOUNT", "6")),   # you said 12 earlier, but default 6 to be safe
+    "realdiscount": None,                # None => send all items from page 1 on initial run (you chose Option A)
     "couponscorpion": int(os.getenv("INIT_COUPONSCORPION", "6")),
-    "discudemy": int(os.getenv("INIT_DISCUDUDY", "10")),        # discudemy we keep bigger default
+    "discudemy": int(os.getenv("INIT_DISCUDEMY", "10")),
 }
 
-# Scheduler interval (seconds) for monitoring first page
-MONITOR_INTERVAL = int(os.getenv("MONITOR_INTERVAL_SECONDS", str(4 * 60)))  # default 4 minutes
+# scraping page counts
+REALDISCOUNT_PAGES = int(os.getenv("REALDISCOUNT_PAGES", "1"))  # we will use page 1 only by choice
+COUPONSCORP_PAGES = int(os.getenv("COUPONSCORP_PAGES", "1"))    # homepage (we use max_posts not pages for couponscorpion)
+DISCUD_PAGES = int(os.getenv("DISCUD_PAGES", "3"))
 
-# Last-sent storage file (single JSON containing keys per source)
+# storage
 DATA_DIR = Path("data")
+DATA_DIR.mkdir(exist_ok=True)
 LAST_SENT_FILE = DATA_DIR / "last_sent.json"
 
-# HTTP settings
+# HTTP / timing
 REQUEST_TIMEOUT = 15
-SHORTENER_RETRIES = 3
+TELEGRAM_RETRIES = 3
 
-# ----------------------------------------------------
 # Logging
 logging.basicConfig(
     format="%(asctime)s — %(levelname)s — %(message)s",
-    level=getattr(logging, LOG_LEVEL.upper(), logging.INFO)
+    level=logging.INFO
 )
 logger = logging.getLogger("udemy-bot")
 
-# ---------------------- UTIL: last-sent storage ----------------------
-DATA_DIR.mkdir(exist_ok=True)
-
+# -------------------- UTIL: last-sent --------------------
 def load_last_sent():
-    if LAST_SENT_FILE.exists():
-        try:
+    default = {"realdiscount": None, "couponscorpion": None, "discudemy": None}
+    try:
+        if LAST_SENT_FILE.exists():
             with LAST_SENT_FILE.open("r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            logger.warning(f"Could not load last_sent file: {e}")
-            return {}
-    return {}
+                data = json.load(f)
+                default.update(data)
+    except Exception as e:
+        logger.warning(f"Could not load last_sent file: {e}")
+    return default
 
-def save_last_sent(obj):
+def save_last_sent(state):
     try:
         with LAST_SENT_FILE.open("w", encoding="utf-8") as f:
-            json.dump(obj, f, indent=2)
+            json.dump(state, f, indent=2)
     except Exception as e:
         logger.error(f"Failed to write last_sent file: {e}")
 
-# ---------------------- ShrinkMe shortener ----------------------
-class ShrinkMe:
-    def __init__(self, api_key):
-        self.api_key = api_key
-        self.session = requests.Session()
-        self.session.headers.update({
-            "User-Agent": "UdemyCouponBot/1.0 (+https://github.com/yourrepo)"
-        })
+last_sent_state = load_last_sent()
 
-    def shorten(self, url):
-        if not self.api_key:
-            return url
-        api_endpoint = "https://shrinkme.io/api"
-        params = {"api": self.api_key, "url": url, "format": "json"}
-        for attempt in range(1, SHORTENER_RETRIES + 1):
-            try:
-                resp = self.session.get(api_endpoint, params=params, timeout=REQUEST_TIMEOUT)
-                resp.raise_for_status()
-                data = resp.json()
-                # API example returns {"status":"success","shortenedUrl":"https:\/\/shrinkme.click\/abc"}
-                shortened = data.get("shortenedUrl") or data.get("short_url") or data.get("shortened_url")
-                if shortened:
-                    # Unescape backslashes if present
-                    shortened = shortened.replace("\\/", "/")
-                    return shortened
-                # some endpoints return text if format=text; fallback
-                txt = resp.text.strip()
-                if txt:
-                    return txt
-            except Exception as e:
-                logger.warning(f"ShrinkMe try {attempt} failed: {e}")
-                time.sleep(0.5 * attempt)
-        logger.error(f"ShrinkMe failed, falling back to original: {url}")
-        return url
-
+# -------------------- Shortener --------------------
 shortener = ShrinkMe(SHRINKME_API_KEY)
 
-# ---------------------- Telegram sender ----------------------
-def send_to_telegram(course):
-    """
-    course expected shape:
-    {
-      "source": "realdiscount" | "couponscorpion" | "discudemy",
-      "title": ...,
-      "description": ...,
-      "image_url": ...,
-      "udemy_url": ...,
-      "slug": ...,
-      "coupon_code": ...,
-      "post_url": ...
-    }
-    """
-    try:
-        title = course.get("title") or ""
-        description = course.get("description") or ""
-        image = course.get("image_url")
-        udemy_url = course.get("udemy_url") or course.get("post_url") or ""
-        is_free = course.get("is_free", False)
-        slug = course.get("slug") or "course"
-
-        # shorten udemy_url
-        short = shortener.shorten(udemy_url)
-
-        # Compose caption
-        short_desc = (description[:200] + "...") if len(description) > 200 else description
-        course_label = f"{title}"
-        rating_text = ""  # could be randomized if desired
-        caption = (
-            f"🎁 *{course_label}*\n\n"
-            f"{short_desc}\n\n"
-            f"👉 Access Course:\n{short}"
-        )
-
-        # Inline keyboard
-        reply_markup = {
-            "inline_keyboard": [[{"text": "🎓 Get Free Course", "url": short}]]
-        }
-
-        if image and image.startswith("http"):
-            payload = {
-                "chat_id": CHANNEL_ID,
-                "photo": image,
-                "caption": caption,
-                "parse_mode": "Markdown",
-                "reply_markup": json.dumps(reply_markup)
-            }
-            endpoint = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-        else:
-            payload = {
-                "chat_id": CHANNEL_ID,
-                "text": caption,
-                "parse_mode": "Markdown",
-                "reply_markup": json.dumps(reply_markup)
-            }
-            endpoint = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-
-        # Try with retries
-        for attempt in range(3):
-            try:
-                resp = requests.post(endpoint, data=payload, timeout=REQUEST_TIMEOUT)
-                resp.raise_for_status()
-                result = resp.json()
-                if result.get("ok"):
-                    logger.info(f"Posted: {title}")
-                    return True
-                else:
-                    logger.error(f"Telegram API error: {result}")
-            except Exception as e:
-                logger.warning(f"Telegram send attempt {attempt+1} failed: {e}")
-                time.sleep(1 + attempt)
-        logger.error(f"Failed to post to Telegram: {title}")
-        return False
-
-    except Exception as e:
-        logger.exception(f"Error in send_to_telegram: {e}")
-        return False
-
-# ---------------------- Common helpers ----------------------
-def make_course_id(source, slug, coupon_code):
-    # deterministic id per source (string)
-    return f"{source}|{slug}:{coupon_code}"
-
-def find_new_items(items, last_sent_id, source):
-    """
-    Items assumed ordered newest -> older.
-    Returns list of NEW items to send, in order from oldest->newest (so sending is oldest first).
-    """
-    if not items:
-        return []
-
-    if not last_sent_id:
-        # no previous history, return up to initial limit for that source
-        limit = INITIAL_SEND_LIMIT.get(source, 5)
-        # send the newest `limit` items but we will return them oldest-first for nicer chronology
-        return list(reversed(items[:limit]))
-
-    # find index of last_sent_id in items
-    new_items = []
-    found = False
-    for item in items:
-        slug = item.get("slug") or ""
-        coupon = item.get("coupon_code") or item.get("coupon") or ""
-        cid = make_course_id(source, slug, coupon)
-        if cid == last_sent_id:
-            found = True
-            break
-        new_items.append(item)
-
-    if not found:
-        # last_sent not present on first page - treat everything as new but to avoid spam cap to safe limit
-        cap = INITIAL_SEND_LIMIT.get(source, 5)
-        logger.info(f"Last-sent id not found for {source}, treating up to {cap} newest as new.")
-        return list(reversed(items[:cap]))
-
-    # we have items newer than last_sent_id in new_items (newest first)
-    return list(reversed(new_items))  # send oldest-first
-
-# ---------------------- Orchestration: per-source flow ----------------------
-def process_source(scraper_obj, source_name, max_posts=12):
-    """
-    Generic function to scrape, detect new items for a source, send them,
-    and update last_sent for that source.
-    """
-    last_sent = last_sent_state.get(source_name)
-    logger.info(f"[{source_name}] Starting scrape (last_sent={last_sent})")
-    try:
-        items = scraper_obj.scrape(max_posts=max_posts)
-    except Exception as e:
-        logger.error(f"[{source_name}] Scrape failed: {e}", exc_info=True)
-        return
-
-    if not items:
-        logger.info(f"[{source_name}] No items returned")
-        return
-
-    logger.info(f"[{source_name}] Retrieved {len(items)} items")
-
-    new_items = find_new_items(items, last_sent, source_name)
-    if not new_items:
-        logger.info(f"[{source_name}] No new items to send")
-        return
-
-    logger.info(f"[{source_name}] {len(new_items)} new items to send")
-
-    sent_any = False
-    for item in new_items:
-        try:
-            success = send_to_telegram(item)
-            time.sleep(random.uniform(0.8, 2.5))  # polite delay
-            if success:
-                # update last_sent to this item (most recent sent)
-                slug = item.get("slug") or ""
-                coupon = item.get("coupon_code") or item.get("coupon") or ""
-                cid = make_course_id(source_name, slug, coupon)
-                last_sent_state[source_name] = cid
-                save_last_sent(last_sent_state)
-                sent_any = True
-        except Exception as e:
-            logger.error(f"[{source_name}] Error sending item: {e}", exc_info=True)
-
-    if sent_any:
-        logger.info(f"[{source_name}] Done sending new items, last_sent updated -> {last_sent_state[source_name]}")
-    else:
-        logger.info(f"[{source_name}] No items were sent successfully")
-
-# ---------------------- Main scheduled job ----------------------
-def job_scrape_all():
-    logger.info("====== job_scrape_all START ======")
-    try:
-        # RealDiscount first
-        rd = RealDiscountScraper()
-        process_source(rd, "realdiscount", max_posts=12)
-        rd.close()
-
-        # CouponScorpion next
-        cs = CouponScorpionScraper()
-        process_source(cs, "couponscorpion", max_posts=12)
-        cs.close()
-
-        # DiscUdemy last
-        dd = DiscUdemyScraper(timeout=20)
-        process_source(dd, "discudemy", max_posts=10)
-        dd.close()
-
-    except Exception as e:
-        logger.error(f"Top-level scraping error: {e}", exc_info=True)
-    logger.info("====== job_scrape_all END ======")
-
-# ---------------------- Flask health ----------------------
+# -------------------- Flask health --------------------
 app = Flask(__name__)
 
 @app.route("/healthz")
 def healthz():
     return "OK", 200
 
-# ---------------------- Startup Sequence ----------------------
-# Load last_sent state
-last_sent_state = load_last_sent()
-# ensure keys exist
-for key in ("realdiscount", "couponscorpion", "discudemy"):
-    last_sent_state.setdefault(key, None)
+# run health server in a thread (used on Render + local)
+def run_health_server():
+    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
 
-# If run as main, run initial scrape once then start scheduler
-def start_bot():
-    logger.info(f"Health endpoint running on port {PORT}")
-    # Run initial scrape (realdiscount first)
-    job_scrape_all()
+# -------------------- Helpers --------------------
+def make_course_id(source, slug, coupon_code):
+    slug = slug or ""
+    coupon = coupon_code or ""
+    return f"{source}|{slug}:{coupon}"
 
-    # Start scheduler to run monitor periodically
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(job_scrape_all, "interval", seconds=MONITOR_INTERVAL, id="job_scrape")
-    scheduler.start()
-    logger.info(f"Scheduler started. Monitoring every {MONITOR_INTERVAL} seconds")
+def random_rating():
+    return round(random.uniform(4.1, 4.9), 1)
 
+def random_students():
+    # realistic students count: 10k - 90k
+    return random.randint(10_000, 90_000)
+
+def short_or_original(url):
     try:
-        # Start Flask web server (blocking)
-        app.run(host="0.0.0.0", port=PORT)
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Stopping...")
-        scheduler.shutdown()
+        if not url:
+            return url
+        short = shortener.shorten(url)
+        return short or url
+    except Exception as e:
+        logger.warning(f"Shortening failed: {e}")
+        return url
+
+# -------------------- Telegram rich card (Version 2) --------------------
+def build_caption(course):
+    title = course.get("title") or (course.get("slug") or "").replace("-", " ").title()
+    desc = course.get("description") or ""
+    is_free = bool(course.get("is_free")) or (course.get("coupon_code") == "FREE")
+    rating = random_rating()
+    students = random_students()
+    enrolls_left = random.randint(50, 2000)
+
+    # short description
+    short_desc = desc if len(desc) <= 220 else (desc[:217] + "...")
+
+    # badges
+    badge = "🆓 ALWAYS FREE" if is_free else f"⏰ LIMITED TIME ({enrolls_left} Enrolls Left)"
+
+    caption = (
+        f"<b>{title}</b>\n\n"
+        f"{badge}\n"
+        f"⭐ {rating}/5 | 👩‍🎓 {students:,} students | 🌐 English\n\n"
+        f"{short_desc}\n\n"
+        f"🔗 Open the course below"
+    )
+    return caption
+
+def send_course_to_telegram(course, source):
+    """
+    Send a course as a rich card (sendPhoto when possible).
+    Updates last_sent_state on success.
+    """
+    try:
+        title = course.get("title") or (course.get("slug") or "").replace("-", " ").title()
+        image = course.get("image_url")
+        udemy_url = course.get("udemy_url") or course.get("post_url") or ""
+        coupon_code = course.get("coupon_code") or course.get("coupon") or ""
+        slug = course.get("slug") or ""
+        course_id = make_course_id(source, slug, coupon_code)
+
+        # Shorten link (best-effort)
+        link = udemy_url or course.get("post_url") or ""
+        short_link = short_or_original(link)
+
+        caption = build_caption(course)
+
+        # Inline keyboard with CTA
+        reply_markup = {
+            "inline_keyboard": [[{"text": "🎓 Get Free Course", "url": short_link or link}]]
+        }
+
+        # Choose sendPhoto (to show image card) or sendMessage
+        if image and image.startswith("http"):
+            payload = {
+                "chat_id": CHANNEL_ID,
+                "photo": image,
+                "caption": caption,
+                "parse_mode": "HTML",
+                "reply_markup": json.dumps(reply_markup)
+            }
+            endpoint = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+        else:
+            payload = {
+                "chat_id": CHANNEL_ID,
+                "text": f"{caption}\n\n{short_link or link}",
+                "parse_mode": "HTML",
+                "reply_markup": json.dumps(reply_markup)
+            }
+            endpoint = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+
+        # Send with retries
+        for attempt in range(TELEGRAM_RETRIES):
+            try:
+                r = requests.post(endpoint, data=payload, timeout=REQUEST_TIMEOUT)
+                r.raise_for_status()
+                j = r.json()
+                if j.get("ok"):
+                    logger.info(f"✅ Sent ({source}): {title}")
+                    # update last_sent for this source
+                    last_sent_state[source] = course_id
+                    save_last_sent(last_sent_state)
+                    return True
+                else:
+                    logger.warning(f"Telegram API returned not ok: {j}")
+            except Exception as e:
+                logger.warning(f"Telegram send attempt {attempt+1} failed: {e}")
+                time.sleep(1 + attempt)
+        logger.error(f"❌ Failed to send to Telegram after retries: {title}")
+        return False
+    except Exception as e:
+        logger.exception(f"Error sending course to Telegram: {e}")
+        return False
+
+# -------------------- Per-source new item detection --------------------
+def find_new_items_for_source(items, source):
+    """
+    items: list ordered newest -> older
+    source: 'realdiscount'|'couponscorpion'|'discudemy'
+    Returns list of new items to send in chronological order (oldest-first).
+    Behavior:
+      - If last_sent is None -> returns initial set:
+          * For realdiscount: all items (user chose Option A)
+          * For others: up to INITIAL_SEND_LIMIT[source]
+      - Otherwise: return items that appear before last_sent id on the page (newer)
+    """
+    if not items:
+        return []
+
+    last_sent = last_sent_state.get(source)
+    # Build list of ids for items
+    ids = []
+    for it in items:
+        slug = it.get("slug") or ""
+        coupon = it.get("coupon_code") or it.get("coupon") or ""
+        ids.append(make_course_id(source, slug, coupon))
+
+    # If no last_sent -> initial behavior
+    if not last_sent:
+        if source == "realdiscount":
+            new_items = items[:]  # all items (user wanted all items from page 1)
+        else:
+            limit = INITIAL_SEND_LIMIT.get(source, 5)
+            new_items = items[:limit]
+        # Return oldest-first
+        return list(reversed(new_items))
+
+    # If last_sent exists, find it in current items
+    new_items = []
+    found = False
+    for it in items:
+        cur_id = make_course_id(source, it.get("slug") or "", it.get("coupon_code") or it.get("coupon") or "")
+        if cur_id == last_sent:
+            found = True
+            break
+        new_items.append(it)
+
+    if not found:
+        # last_sent not found on the first page -> treat newest up to safe cap as new to avoid spamming too many
+        cap = INITIAL_SEND_LIMIT.get(source, 10) or 10
+        logger.info(f"[{source}] last_sent not on page -> treating up to {cap} newest items as new")
+        return list(reversed(items[:cap]))
+
+    # items collected are in newest->older order; return oldest->newest
+    return list(reversed(new_items))
+
+# -------------------- Source processing --------------------
+def process_realdiscount(max_pages=1):
+    try:
+        logger.info(f"[realdiscount] Starting scrape (last_sent={last_sent_state.get('realdiscount')})")
+        rd = RealDiscountScraper()
+        items = rd.scrape(max_pages=max_pages)
+        rd.close()
+        if not items:
+            logger.info("[realdiscount] No items returned")
+            return
+        logger.info(f"[realdiscount] Retrieved {len(items)} items")
+        new = find_new_items_for_source(items, "realdiscount")
+        if not new:
+            logger.info("[realdiscount] No new items to send")
+            return
+        logger.info(f"[realdiscount] {len(new)} new items to send")
+        for it in new:
+            sent = send_course_to_telegram(it, "realdiscount")
+            time.sleep(random.uniform(0.6, 1.6))
+        logger.info("[realdiscount] Processing complete")
+    except Exception as e:
+        logger.exception(f"[realdiscount] error: {e}")
+
+def process_couponscorpion(max_posts=12):
+    try:
+        logger.info(f"[couponscorpion] Starting scrape (last_sent={last_sent_state.get('couponscorpion')})")
+        cs = CouponScorpionScraper()
+        items = cs.scrape(max_posts=max_posts)
+        cs.close()
+        if not items:
+            logger.info("[couponscorpion] No items returned")
+            return
+        logger.info(f"[couponscorpion] Retrieved {len(items)} items")
+        new = find_new_items_for_source(items, "couponscorpion")
+        if not new:
+            logger.info("[couponscorpion] No new items to send")
+            return
+        logger.info(f"[couponscorpion] {len(new)} new items to send")
+        for it in new:
+            sent = send_course_to_telegram(it, "couponscorpion")
+            time.sleep(random.uniform(0.6, 1.6))
+        logger.info("[couponscorpion] Processing complete")
+    except Exception as e:
+        logger.exception(f"[couponscorpion] error: {e}")
+
+def process_discudemy(max_pages=3):
+    try:
+        logger.info(f"[discudemy] Starting scrape (last_sent={last_sent_state.get('discudemy')})")
+        dd = DiscUdemyScraper(timeout=20)
+        items = dd.scrape(max_pages=max_pages)
+        dd.close()
+        if not items:
+            logger.info("[discudemy] No items returned")
+            return
+        logger.info(f"[discudemy] Retrieved {len(items)} items")
+        new = find_new_items_for_source(items, "discudemy")
+        if not new:
+            logger.info("[discudemy] No new items to send")
+            return
+        logger.info(f"[discudemy] {len(new)} new items to send")
+        for it in new:
+            sent = send_course_to_telegram(it, "discudemy")
+            time.sleep(random.uniform(0.6, 1.6))
+        logger.info("[discudemy] Processing complete")
+    except Exception as e:
+        logger.exception(f"[discudemy] error: {e}")
+
+# -------------------- Orchestration job --------------------
+def job_scrape_all():
+    logger.info("====== job_scrape_all START ======")
+    # Order: RealDiscount -> CouponScorpion -> DiscUdemy
+    process_realdiscount(max_pages=REALDISCOUNT_PAGES)
+    process_couponscorpion(max_posts=12)
+    process_discudemy(max_pages=DISCUD_PAGES)
+    logger.info("====== job_scrape_all END ======")
+
+# -------------------- Scheduler --------------------
+def start_scheduler():
+    sched = BackgroundScheduler()
+    sched.add_job(job_scrape_all, "interval", seconds=MONITOR_INTERVAL_SECONDS, id="job_scrape")
+    sched.start()
+    return sched
+
+# -------------------- Main --------------------
+def sanity_check_env():
+    missing = []
+    if not BOT_TOKEN:
+        missing.append("BOT_TOKEN")
+    if not CHANNEL_ID:
+        missing.append("CHANNEL_ID")
+    if missing:
+        logger.error(f"Missing env vars: {missing}. Set them and restart.")
+        return False
+    return True
 
 if __name__ == "__main__":
-    # Validate environment variables early
-    missing = []
-    if not BOT_TOKEN: missing.append("BOT_TOKEN")
-    if not CHANNEL_ID: missing.append("CHANNEL_ID")
-    if not SHRINKME_API_KEY: 
-        logger.warning("SHRINKME_API_KEY is not set — links will not be shortened (original links used).")
-
-    if missing:
-        logger.error(f"Missing required environment variables: {missing}. Exiting.")
+    if not sanity_check_env():
         sys.exit(1)
 
-    # Start in a background thread the Flask server if desired, but start_bot runs it.
-    start_bot()
+    # Start health server in thread
+    t = threading.Thread(target=run_health_server, daemon=True)
+    t.start()
+    logger.info(f"Health endpoint running on port {PORT}")
+
+    # Initial run on startup (will send items per-source depending on last_sent)
+    try:
+        logger.info("🔎 Initial scrape started — RealDiscount first, then CouponScorpion, then DiscUdemy")
+        job_scrape_all()
+    except Exception as e:
+        logger.exception(f"Initial job failed: {e}")
+
+    # Start scheduler
+    scheduler = start_scheduler()
+    logger.info(f"Scheduler started - monitoring every {MONITOR_INTERVAL_SECONDS} seconds")
+
+    # Keep main thread alive
+    try:
+        while True:
+            time.sleep(60)
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Shutting down scheduler...")
+        scheduler.shutdown(wait=False)
+        logger.info("Exiting.")
