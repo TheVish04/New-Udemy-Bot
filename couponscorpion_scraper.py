@@ -1,93 +1,209 @@
-# couponscorpion_scraper.py
+# couponscorpion_scraper.py (final, robust version)
 import requests
 import time
 import random
 import logging
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse, parse_qs, quote
+from urllib.parse import urljoin, urlparse, parse_qs
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 class CouponScorpionScraper:
+    """
+    Final robust scraper for couponscorpion.com (homepage latest Udemy posts).
+    - scrape(max_posts=12) will return up to max_posts newest posts from homepage.
+    - Each returned item is a dict:
+      {
+        "source": "couponscorpion",
+        "post_url": ...,
+        "title": ...,
+        "image_url": ...,
+        "description": ...,
+        "udemy_url": ...,
+        "slug": ...,
+        "coupon_code": ...,
+        "is_free": True/False
+      }
+    """
     BASE = "https://couponscorpion.com"
-    CATEGORY = "/category/udemy-free-100-discount/"  # main listing page
 
     def __init__(self, timeout=15, session=None):
         self.timeout = timeout
         self.session = session or requests.Session()
         self.session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
         })
 
     def close(self):
         try:
             self.session.close()
-        except:
+        except Exception:
             pass
 
-    def _get_soup(self, url):
-        time.sleep(random.uniform(0.6, 1.2))
-        r = self.session.get(url, timeout=self.timeout)
-        r.raise_for_status()
-        return BeautifulSoup(r.content, "html.parser"), r
+    # small polite random sleep to avoid hammering the site
+    def _sleep(self, a=0.6, b=1.2):
+        time.sleep(random.uniform(a, b))
 
-    def _extract_post_items_from_listing(self, page=1):
-        """
-        Return a list of post URLs found on the listing page.
-        We only implement page=1 for your requirement.
-        """
-        if page <= 1:
-            url = urljoin(self.BASE, self.CATEGORY)
-        else:
-            url = urljoin(self.BASE, f"{self.CATEGORY}page/{page}/")
+    def _get_soup(self, url, allow_redirects=True, tries=2):
+        for attempt in range(tries):
+            try:
+                self._sleep()
+                resp = self.session.get(url, timeout=self.timeout, allow_redirects=allow_redirects)
+                resp.raise_for_status()
+                return BeautifulSoup(resp.content, "html.parser"), resp
+            except Exception as e:
+                logger.debug(f"_get_soup attempt {attempt+1} failed for {url}: {e}")
+                time.sleep(0.8 + attempt)
+                continue
+        raise RuntimeError(f"Failed to GET {url}")
 
+    def _collect_post_urls_from_homepage(self):
+        """
+        Collect candidate post URLs from the homepage.
+        Filters out obvious non-post links and tries to keep posts with >=2 path segments.
+        """
+        url = self.BASE + "/"
         try:
             soup, _ = self._get_soup(url)
         except Exception as e:
-            logger.error(f"Error loading CouponScorpion listing page {page}: {e}")
+            logger.error(f"Error loading CouponScorpion homepage: {e}")
             return []
 
-        posts = []
-        # Posts appear inside <article class="col_item offer_grid ..."> or similar
-        # We search for article elements that have post links
+        candidates = []
+
+        # Primary: look for article blocks with an anchor
         for article in soup.find_all("article"):
             try:
                 a = article.find("a", href=True)
-                if not a: 
+                if not a:
                     continue
-                post_url = a["href"]
-                # normalize to absolute
-                if post_url.startswith("/"):
-                    post_url = urljoin(self.BASE, post_url)
-                posts.append(post_url)
+                href = a["href"].strip()
+                if href.startswith("/"):
+                    href = urljoin(self.BASE, href)
+                if href.startswith(self.BASE):
+                    # require at least two path parts to exclude category/home links
+                    parts = urlparse(href).path.strip("/").split("/")
+                    if len(parts) >= 2:
+                        candidates.append(href)
             except Exception:
                 continue
+
+        # Fallback: scan anchors in main content area
+        if not candidates:
+            main = soup.find("main") or soup
+            for a in main.find_all("a", href=True):
+                href = a["href"].strip()
+                if href.startswith("/"):
+                    href = urljoin(self.BASE, href)
+                if href.startswith(self.BASE):
+                    parts = urlparse(href).path.strip("/").split("/")
+                    if len(parts) >= 2:
+                        candidates.append(href)
 
         # dedupe while preserving order
         seen = set()
         unique = []
-        for p in posts:
-            if p not in seen:
-                seen.add(p)
-                unique.append(p)
+        for u in candidates:
+            if u not in seen:
+                seen.add(u)
+                unique.append(u)
 
-        logger.info(f"CouponScorpion listing: found {len(unique)} posts")
+        logger.info(f"CouponScorpion homepage: found {len(unique)} candidate post URLs")
         return unique
+
+    def _find_coupon_button_on_post(self, soup):
+        """
+        Heuristics to find the GET COUPON CODE button href on a post page.
+        Returns a fully qualified href (may be internal redirect script or direct udemy link).
+        """
+        # 1) anchors with obvious text
+        for a in soup.find_all("a", href=True):
+            txt = a.get_text(" ", strip=True).lower()
+            href = a["href"]
+            if any(k in txt for k in ("get coupon", "get coupon code", "coupon code", "redeem", "buy now", "get deal", "get offer", "get course")):
+                return urljoin(self.BASE, href)
+
+        # 2) anchors that contain udemy link directly
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if "udemy.com/course" in href:
+                return urljoin(self.BASE, href)
+
+        # 3) anchors whose href contains well-known redirect patterns
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if any(substr in href for substr in ("/scripts/udemy", "coupon.php", "/out/", "/go/", "coupon.php", "udemy-redirect")):
+                return urljoin(self.BASE, href)
+
+        # 4) anchors with classes used on many posts
+        classes_try = ["btn_offer_block", "re_track_btn", "btn_offer", "btn-offer", "offer-btn", "rh_button_wrapper"]
+        for cls in classes_try:
+            a = soup.find("a", class_=lambda v: v and cls in v)
+            if a and a.get("href"):
+                return urljoin(self.BASE, a["href"])
+
+        # 5) container-based lookup (price/button wrappers)
+        containers = soup.find_all(class_=lambda v: v and ("price" in v or "button" in v or "offer" in v))
+        for c in containers:
+            a = c.find("a", href=True)
+            if a:
+                return urljoin(self.BASE, a["href"])
+
+        # nothing found
+        return None
+
+    def _follow_and_get_final(self, href):
+        """
+        Follow href (allow_redirects=True) and return final destination URL.
+        If following fails, return the original href.
+        """
+        try:
+            self._sleep(0.4, 0.9)
+            resp = self.session.get(href, timeout=self.timeout, allow_redirects=True)
+            resp.raise_for_status()
+            final = resp.url
+            return final
+        except Exception as e:
+            logger.warning(f"Failed to follow coupon href {href}: {e}")
+            return href
+
+    def _parse_udemy_url(self, url):
+        """
+        Parse a Udemy URL to extract slug and coupon code.
+        Returns (slug, coupon_code, is_free)
+        """
+        try:
+            parsed = urlparse(url)
+            if "udemy.com" not in (parsed.netloc or ""):
+                return (None, "", False)
+
+            path_parts = parsed.path.strip("/").split("/")
+            slug = None
+            if "course" in path_parts:
+                idx = path_parts.index("course")
+                if idx + 1 < len(path_parts):
+                    slug = path_parts[idx + 1]
+            elif path_parts:
+                slug = path_parts[-1]
+
+            qs = parse_qs(parsed.query)
+            code = qs.get("couponCode") or qs.get("coupon") or qs.get("promo") or qs.get("p")
+            if code:
+                return (slug, code[0], False)
+
+            # If no coupon param present, treat as FREE (heuristic)
+            return (slug, "FREE", True)
+        except Exception:
+            return (None, "", False)
 
     def _extract_from_post(self, post_url):
         """
-        Follow a post page and extract:
-        - post_url (original)
-        - title
-        - image_url (if any)
-        - description (short)
-        - final udemy_url (if available) and if coupon code present
-        - slug (derived from udemy_url or post_url)
-        - coupon_code or "FREE"
-        - is_free boolean
+        Open a post page and extract structured course info.
         """
         try:
-            soup, resp = self._get_soup(post_url)
+            soup, _ = self._get_soup(post_url)
         except Exception as e:
             logger.error(f"Error opening post {post_url}: {e}")
             return None
@@ -105,158 +221,84 @@ class CouponScorpionScraper:
         }
 
         # Title
-        h = soup.find(["h1", "h2", "h3"])
+        h = soup.find(["h1", "h2"])
         if h:
             item["title"] = h.get_text(strip=True)
 
-        # Try to get a main image from the article (figure img or og:image)
-        og_image = soup.find("meta", property="og:image")
-        if og_image and og_image.get("content"):
-            item["image_url"] = og_image.get("content")
+        # Image - prefer og:image
+        og = soup.find("meta", property="og:image")
+        if og and og.get("content"):
+            item["image_url"] = og.get("content")
         else:
-            img = soup.find("figure")
-            if img:
-                img_tag = img.find("img")
-                if img_tag and img_tag.get("src"):
-                    item["image_url"] = img_tag.get("src")
+            fig = soup.find("figure")
+            if fig:
+                img = fig.find("img")
+                if img and img.get("src"):
+                    item["image_url"] = img.get("src")
 
-        # Short description - first paragraph in content
-        content = soup.find("div", class_="entry-content")
+        # Description - first non-empty paragraph inside content/article
+        content = soup.find("div", class_=lambda v: v and ("entry-content" in v or "post-content" in v or "content" in v))
         if not content:
-            # fallback to main article area
             content = soup.find("article")
         if content:
-            p = content.find("p")
-            if p:
-                text = p.get_text(strip=True)
-                item["description"] = text if text else None
-
-        # Find the coupon / button link.
-        # In your screenshots button anchor had class btn_offer_block or href with '/scripts/udemy' etc.
-        coupon_link = None
-
-        # Common approach: find anchor buttons under .rh_button_wrapper or .rh_price_wrapper
-        for selector in [
-            ("a", {"class": lambda v: v and "btn_offer_block" in v}),
-            ("a", {"class": lambda v: v and "btn_offer_block" in v}),
-            ("a", {"href": lambda v: v and "/scripts/udemy" in v}),
-            ("a", {"href": lambda v: v and "udemy.com/course" in v}),
-            ("a", {"class": lambda v: v and "btn_offer_block" in v})
-        ]:
-            tagname, attrs = selector
-            found = content.find(tagname, attrs=attrs) if content else None
-            if found and found.get("href"):
-                coupon_link = found.get("href")
-                break
-
-        # If not found inside content, search entire page for 'GET COUPON' anchors
-        if not coupon_link:
-            anchors = soup.find_all("a", href=True)
-            for a in anchors:
-                txt = a.get_text(" ", strip=True).lower()
-                href = a["href"]
-                if "get coupon" in txt or "get coupon code" in txt or "/scripts/udemy" in href or "udemy.com/course" in href:
-                    coupon_link = href
+            for p in content.find_all("p"):
+                txt = p.get_text(strip=True)
+                if txt:
+                    item["description"] = txt
                     break
 
-        # Normalize coupon_link
-        if coupon_link:
-            if coupon_link.startswith("/"):
-                coupon_link = urljoin(self.BASE, coupon_link)
-            item["coupon_link_raw"] = coupon_link
+        # Find coupon button href
+        coupon_href = self._find_coupon_button_on_post(soup)
+        if coupon_href:
+            if coupon_href.startswith("/"):
+                coupon_href = urljoin(self.BASE, coupon_href)
+            item["coupon_link_raw"] = coupon_href
 
-            # If coupon_link is a direct udemy link, parse it directly
-            if "udemy.com/course" in coupon_link:
-                udemy_url = coupon_link
-            else:
-                # Follow the coupon_link to get the final redirect (follow once)
-                try:
-                    time.sleep(random.uniform(0.4, 1.0))
-                    resp2 = self.session.get(coupon_link, timeout=self.timeout, allow_redirects=True)
-                    final = resp2.url
-                    udemy_url = final
-                except Exception as e:
-                    logger.warning(f"Could not follow coupon link {coupon_link}: {e}")
-                    udemy_url = coupon_link  # fallback
+            # follow redirects to get final target (often udemy)
+            final = self._follow_and_get_final(coupon_href)
+            item["udemy_url"] = final
 
-            item["udemy_url"] = udemy_url
-
-            # Try to parse udemy slug / coupon code
-            try:
-                parsed = urlparse(udemy_url)
-                if "udemy.com" in parsed.netloc:
-                    path_parts = parsed.path.strip("/").split("/")
-                    slug = None
-                    if "course" in path_parts:
-                        idx = path_parts.index("course")
-                        if idx + 1 < len(path_parts):
-                            slug = path_parts[idx + 1]
-                    else:
-                        if path_parts:
-                            slug = path_parts[-1]
-                    item["slug"] = slug
-
-                    qs = parse_qs(parsed.query)
-                    code = qs.get("couponCode") or qs.get("coupon")
-                    if code:
-                        item["coupon_code"] = code[0]
-                        item["is_free"] = False
-                    else:
-                        # If udemy url has no coupon, and price shows $0 on page, treat as free
-                        # check for $0 on post page
-                        price_node = soup.find(text=lambda x: x and "$0" in x)
-                        if price_node:
-                            item["coupon_code"] = "FREE"
-                            item["is_free"] = True
-                        else:
-                            # If link or page suggests free, mark free
-                            if "/free" in udemy_url or "free" in udemy_url.lower():
-                                item["coupon_code"] = "FREE"
-                                item["is_free"] = True
-                else:
-                    # Not directly udemy; keep coupon_link as-is and mark coupon_code empty
-                    item["coupon_code"] = ""
-            except Exception:
-                pass
-
+            slug, code, is_free = self._parse_udemy_url(final)
+            item["slug"] = slug
+            item["coupon_code"] = code or ""
+            item["is_free"] = bool(is_free)
         else:
-            logger.warning(f"No coupon link found for {post_url}")
+            logger.info(f"No coupon button found on post {post_url}")
 
-        # Final fallback slug if still missing: derive from post_url
-        if not item.get("slug"):
+        # fallback slug from post_url if still missing
+        if not item["slug"]:
             try:
-                parsed_post = urlparse(post_url)
-                slug_candidate = parsed_post.path.strip("/").split("/")[-1]
-                item["slug"] = slug_candidate
-            except:
+                item["slug"] = urlparse(post_url).path.strip("/").split("/")[-1]
+            except Exception:
                 item["slug"] = None
 
-        # Normalize fields
-        if item["title"] is None:
-            item["title"] = item["slug"].replace("-", " ").title() if item.get("slug") else "Untitled Course"
+        if not item["title"] and item["slug"]:
+            item["title"] = item["slug"].replace("-", " ").title()
 
         return item
 
-    def scrape(self, max_pages=1):
+    def scrape(self, max_posts=12):
         """
-        Scrape first `max_pages` pages of couponscorpion category (we'll only run with max_pages=1).
-        Returns a list of course dicts (same shape as DiscUdemy).
+        Scrape homepage and return up to max_posts newest Udemy posts.
         """
-        results = []
+        try:
+            posts = self._collect_post_urls_from_homepage()
+        except Exception as e:
+            logger.error(f"Failed to collect posts from homepage: {e}")
+            posts = []
 
-        for p in range(1, max_pages + 1):
+        results = []
+        count = 0
+        for post in posts:
+            if count >= max_posts:
+                break
             try:
-                post_urls = self._extract_post_items_from_listing(page=p)
-                for post in post_urls:
-                    try:
-                        course = self._extract_from_post(post)
-                        if course:
-                            results.append(course)
-                    except Exception as e:
-                        logger.error(f"Error extracting post {post}: {e}")
-                        continue
+                course = self._extract_from_post(post)
+                if course:
+                    results.append(course)
+                    count += 1
             except Exception as e:
-                logger.error(f"Error scraping page {p}: {e}")
+                logger.error(f"Error extracting post {post}: {e}")
                 continue
 
         logger.info(f"CouponScorpion scrape complete: {len(results)} items")
