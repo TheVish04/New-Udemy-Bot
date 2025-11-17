@@ -2,8 +2,8 @@
 """
 Unified Udemy coupon bot
 - Scrapers: couponscorpion -> discudemy
-- Each source keeps its own last_sent ID stored in data/last_sent.json
-- ShrinkMe link shortener used for Telegram links
+- Separate last_sent IDs
+- Uses ShrinkMe shortener
 - Health endpoint + scheduler
 """
 
@@ -14,12 +14,10 @@ import time
 import random
 import logging
 from pathlib import Path
-
 import requests
 from flask import Flask
 from apscheduler.schedulers.background import BackgroundScheduler
 
-# Import scrapers
 from discudemy_scraper import DiscUdemyScraper
 from couponscorpion_scraper import CouponScorpionScraper
 
@@ -30,29 +28,28 @@ CHANNEL_ID = os.getenv("CHANNEL_ID")
 SHRINKME_API_KEY = os.getenv("SHRINKME_API_KEY")
 PORT = int(os.getenv("PORT", "10000"))
 
-# Monitor every 60 seconds (your new preference)
+# monitor every 60 sec
 MONITOR_INTERVAL_SECONDS = int(os.getenv("MONITOR_INTERVAL_SECONDS", "60"))
 
-# No initial limits — send ALL items on first run
+# no initial limits
 INITIAL_SEND_LIMIT = {
     "couponscorpion": None,
     "discudemy": None,
 }
 
-# Only page 1 for all scrapers
+# use only page 1 everywhere
 COUPONSCORP_PAGES = 1
 DISCUD_PAGES = 1
 
 DATA_DIR = Path("data")
 LAST_SENT_FILE = DATA_DIR / "last_sent.json"
-
 REQUEST_TIMEOUT = 15
 SHORTENER_RETRIES = 3
 
 # Logging
 logging.basicConfig(
     format="%(asctime)s — %(levelname)s — %(message)s",
-    level=getattr(logging, LOG_LEVEL.upper(), logging.INFO)
+    level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
 )
 logger = logging.getLogger("udemy-bot")
 
@@ -80,20 +77,14 @@ class ShrinkMe:
     def __init__(self, api_key):
         self.api_key = api_key
         self.session = requests.Session()
-        self.session.headers.update({
-            "User-Agent": "UdemyCouponBot/1.0"
-        })
+        self.session.headers.update({"User-Agent": "UdemyCouponBot/1.0"})
 
     def shorten(self, url):
         if not self.api_key:
             return url
 
         api_url = "https://shrinkme.io/api"
-        params = {
-            "api": self.api_key,
-            "url": url,
-            "format": "json"
-        }
+        params = {"api": self.api_key, "url": url, "format": "json"}
 
         for attempt in range(SHORTENER_RETRIES):
             try:
@@ -104,6 +95,7 @@ class ShrinkMe:
                     return short.replace("\\/", "/")
             except:
                 time.sleep(1)
+
         return url
 
 shortener = ShrinkMe(SHRINKME_API_KEY)
@@ -112,15 +104,12 @@ shortener = ShrinkMe(SHRINKME_API_KEY)
 def send_to_telegram(course):
     try:
         title = course.get("title") or "Course"
-        description = course.get("description") or ""
+        desc = course.get("description") or ""
         image = course.get("image_url")
         udemy_url = course.get("udemy_url") or course.get("post_url")
 
-        # shorten link
         short = shortener.shorten(udemy_url)
-
-        # caption
-        short_desc = (description[:200] + "...") if len(description) > 200 else description
+        short_desc = (desc[:200] + "...") if len(desc) > 200 else desc
 
         caption = (
             f"🎁 *{title}*\n\n"
@@ -128,38 +117,37 @@ def send_to_telegram(course):
             f"👉 Access Course:\n{short}"
         )
 
-        # inline button
         reply_markup = {
             "inline_keyboard": [[{"text": "🎓 Get Free Course", "url": short}]]
         }
 
         if image:
+            endpoint = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
             payload = {
                 "chat_id": CHANNEL_ID,
                 "photo": image,
                 "caption": caption,
                 "parse_mode": "Markdown",
-                "reply_markup": json.dumps(reply_markup)
+                "reply_markup": json.dumps(reply_markup),
             }
-            endpoint = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
         else:
+            endpoint = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
             payload = {
                 "chat_id": CHANNEL_ID,
                 "text": caption,
                 "parse_mode": "Markdown",
-                "reply_markup": json.dumps(reply_markup)
+                "reply_markup": json.dumps(reply_markup),
             }
-            endpoint = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
-        # send
         r = requests.post(endpoint, data=payload, timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
         return True
 
-    except:
+    except Exception as e:
+        logger.error(f"Telegram send failed: {e}")
         return False
 
-# ---------------------- New-item detection ----------------------
+# ---------------------- Helpers ----------------------
 def make_course_id(source, slug, coupon_code):
     return f"{source}|{slug}:{coupon_code}"
 
@@ -168,8 +156,7 @@ def find_new_items(items, last_sent_id, source):
         return []
 
     if last_sent_id is None:
-        # send ALL items on first run
-        return list(reversed(items))  # oldest → newest
+        return list(reversed(items))  # all items on first run
 
     new_items = []
     for item in items:
@@ -180,12 +167,17 @@ def find_new_items(items, last_sent_id, source):
 
     return list(reversed(new_items))
 
-# ---------------------- Process each source ----------------------
+# ---------------------- Process source ----------------------
 def process_source(scraper_obj, source_name):
     logger.info(f"[{source_name}] Starting scrape (last_sent={last_sent_state.get(source_name)})")
 
     try:
-        items = scraper_obj.scrape(max_posts=12)
+        # Corrected: DiscUdemy uses max_pages, CouponScorpion uses max_posts
+        if source_name == "couponscorpion":
+            items = scraper_obj.scrape(max_posts=12)
+        else:
+            items = scraper_obj.scrape(max_pages=1)
+
     except Exception as e:
         logger.error(f"[{source_name}] Scrape failed: {e}")
         return
@@ -195,7 +187,6 @@ def process_source(scraper_obj, source_name):
         return
 
     new_items = find_new_items(items, last_sent_state.get(source_name), source_name)
-
     if not new_items:
         logger.info(f"[{source_name}] No new items to send")
         return
@@ -205,9 +196,10 @@ def process_source(scraper_obj, source_name):
             cid = make_course_id(source_name, course.get("slug"), course.get("coupon_code"))
             last_sent_state[source_name] = cid
             save_last_sent(last_sent_state)
+
         time.sleep(random.uniform(1, 2))
 
-# ---------------------- Main scraper job ----------------------
+# ---------------------- Master job ----------------------
 def job_scrape_all():
     logger.info("====== job_scrape_all START ======")
 
@@ -223,7 +215,7 @@ def job_scrape_all():
 
     logger.info("====== job_scrape_all END ======")
 
-# ---------------------- Health endpoint ----------------------
+# ---------------------- Flask health ----------------------
 app = Flask(__name__)
 
 @app.route("/healthz")
@@ -249,7 +241,7 @@ def start_bot():
 
 if __name__ == "__main__":
     if not BOT_TOKEN or not CHANNEL_ID:
-        logger.error("Missing BOT_TOKEN or CHANNEL_ID in environment.")
+        logger.error("Missing BOT_TOKEN or CHANNEL_ID")
         sys.exit(1)
 
     start_bot()
