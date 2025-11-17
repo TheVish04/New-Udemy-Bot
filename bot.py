@@ -35,17 +35,19 @@ SHRINKME_API_KEY = os.getenv("SHRINKME_API_KEY", "").strip()
 PORT = int(os.getenv("PORT", "10000"))
 
 # Monitoring / initial run settings
-MONITOR_INTERVAL_SECONDS = int(os.getenv("MONITOR_INTERVAL_SECONDS", str(4 * 60)))  # default 4 minutes
+MONITOR_INTERVAL_SECONDS = int(os.getenv("MONITOR_INTERVAL_SECONDS", "60"))
+
+# No initial limit for ANY scraper → send *all* items on first run
 INITIAL_SEND_LIMIT = {
-    "realdiscount": None,                # None => send all items from page 1 on initial run (you chose Option A)
-    "couponscorpion": int(os.getenv("INIT_COUPONSCORPION", "6")),
-    "discudemy": int(os.getenv("INIT_DISCUDEMY", "10")),
+    "realdiscount": None,
+    "couponscorpion": None,
+    "discudemy": None,
 }
 
-# scraping page counts
-REALDISCOUNT_PAGES = int(os.getenv("REALDISCOUNT_PAGES", "1"))  # we will use page 1 only by choice
-COUPONSCORP_PAGES = int(os.getenv("COUPONSCORP_PAGES", "1"))    # homepage (we use max_posts not pages for couponscorpion)
-DISCUD_PAGES = int(os.getenv("DISCUD_PAGES", "3"))
+# Scrape only 1 page for each source
+REALDISCOUNT_PAGES = int(os.getenv("REALDISCOUNT_PAGES", "1"))
+COUPONSCORP_PAGES = int(os.getenv("COUPONSCORP_PAGES", "1"))
+DISCUD_PAGES = int(os.getenv("DISCUD_PAGES", "1"))
 
 # storage
 DATA_DIR = Path("data")
