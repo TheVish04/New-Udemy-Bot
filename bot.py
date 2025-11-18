@@ -34,7 +34,7 @@ CHANNEL_ID = os.getenv("CHANNEL_ID")
 SHRINKME_API_KEY = os.getenv("SHRINKME_API_KEY", "")
 PORT = int(os.getenv("PORT", "10000"))
 
-MONITOR_INTERVAL = int(os.getenv("MONITOR_INTERVAL_SECONDS", "60"))  # every 60 sec
+MONITOR_INTERVAL = int(os.getenv("MONITOR_INTERVAL_SECONDS", "10"))  # every 60 sec
 
 COUPONSCORP_MAX_POSTS = 12
 DISCUD_MAX_PAGES = 1
