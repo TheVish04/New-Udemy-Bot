@@ -8,6 +8,7 @@ import re
 
 logger = logging.getLogger("discudemy")
 
+
 class DiscUdemyScraper:
     BASE = "https://www.discudemy.com"
     LISTING = "/all/{}"
@@ -16,10 +17,8 @@ class DiscUdemyScraper:
         self.timeout = timeout
         self.session = requests.Session()
         self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Connection': 'keep-alive'
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/*,*/*;q=0.8",
         })
 
     def close(self):
@@ -28,177 +27,182 @@ class DiscUdemyScraper:
         except:
             pass
 
-    # -------------------------------------------------------
-    # Get all detail links from /all/page
-    # -------------------------------------------------------
-    def get_detail_urls(self, page_num):
+    # --------------------------------------------------------
+    # Get listing page -> course detail URLs
+    # --------------------------------------------------------
+    def get_detail_urls(self, page_num: int):
         url = f"{self.BASE}{self.LISTING.format(page_num)}"
         try:
+            time.sleep(random.uniform(0.3, 0.8))
             r = self.session.get(url, timeout=self.timeout)
             r.raise_for_status()
-            soup = BeautifulSoup(r.text, "html.parser")
-
-            cards = soup.select("a.card-header")
-            urls = []
-
-            for a in cards:
-                href = a.get("href")
-                if not href:
-                    continue
-                if href.startswith("/"):
-                    href = urljoin(self.BASE, href)
-                # filter only discudemy internal pages
-                if href.startswith(self.BASE) and "/go/" not in href:
-                    urls.append(href)
-
-            # remove duplicates
-            final_urls = []
-            seen = set()
-            for u in urls:
-                if u not in seen:
-                    seen.add(u)
-                    final_urls.append(u)
-
-            logger.info(f"Page {page_num}: Found {len(final_urls)} detail URLs")
-            return final_urls
-
         except Exception as e:
-            logger.error(f"Error loading listing page {page_num}: {e}")
+            logger.error(f"Listing error: {e}")
             return []
 
-    # -------------------------------------------------------
-    # Extract coupon from detail page
-    # -------------------------------------------------------
-    def extract_coupon(self, detail_url):
+        soup = BeautifulSoup(r.text, "html.parser")
+        links = []
+
+        for a in soup.find_all("a", class_="card-header"):
+            href = a.get("href")
+            if not href:
+                continue
+            if href.startswith("/"):
+                href = urljoin(self.BASE, href)
+            if "/go/" not in href and href.startswith(self.BASE):
+                links.append(href)
+
+        # de-dupe
+        final = []
+        seen = set()
+        for x in links:
+            if x not in seen:
+                final.append(x)
+                seen.add(x)
+
+        return final
+
+    # --------------------------------------------------------
+    # Extract actual course page info
+    # --------------------------------------------------------
+    def extract_coupon(self, detail_url: str):
         try:
+            time.sleep(random.uniform(0.3, 0.7))
             r = self.session.get(detail_url, timeout=self.timeout)
             r.raise_for_status()
-            soup = BeautifulSoup(r.text, "html.parser")
-
-            # title
-            title_tag = soup.find("h1") or soup.find("h2") or soup.title
-            title = title_tag.get_text(strip=True) if title_tag else None
-
-            # image extraction
-            img = None
-            for im in soup.find_all("img"):
-                src = im.get("src", "")
-                # detect udemy / course image format
-                if "udemy" in src or "course" in src or "img-c" in src:
-                    img = src
-                    break
-
-            # description (fallback safe)
-            desc = None
-            for p in soup.find_all("p"):
-                txt = p.get_text(strip=True)
-                if len(txt) > 60:
-                    desc = txt
-                    break
-
-            # find the “Take Course” button
-            btn = soup.find("a", class_="discBtn")
-            if not btn or not btn.get("href"):
-                logger.warning(f"No take-course button at {detail_url}")
-                return None
-
-            go_link = btn["href"]
-            if go_link.startswith("/"):
-                go_link = urljoin(self.BASE, go_link)
-
-            # First try: parse udemy URL from ?go= param
-            parsed = urlparse(go_link)
-            q = parse_qs(parsed.query)
-
-            if "go" in q:
-                direct = q["go"][0]
-                if "udemy.com/course" in direct:
-                    return self.build_record(direct, detail_url, go_link, title, desc, img)
-
-            # Otherwise follow go_link
-            try:
-                rr = self.session.get(go_link, timeout=self.timeout)
-                rr.raise_for_status()
-            except Exception as e:
-                logger.warning(f"Go-link failed for {detail_url}: {e}")
-                return None
-
-            html = rr.text
-
-            # regex detect whole coupon URL
-            m = re.search(r"https://www\.udemy\.com/course/[^\"'>\s]+couponCode=[^\"'>\s]+", html)
-            if m:
-                return self.build_record(m.group(0), detail_url, go_link, title, desc, img)
-
-            # detect normal course link
-            m2 = re.search(r"https://www\.udemy\.com/course/[^\"'>\s]+", html)
-            if m2:
-                return self.build_record(m2.group(0), detail_url, go_link, title, desc, img)
-
-            logger.warning(f"No udemy link for detail {detail_url}")
-            return None
-
         except Exception as e:
-            logger.error(f"Error parsing detail {detail_url}: {e}")
+            logger.error(f"Detail page error: {e}")
             return None
 
-    # -------------------------------------------------------
-    # Helper: build final dictionary
-    # -------------------------------------------------------
-    def build_record(self, udemy_url, detail_url, go_link, title, desc, img):
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        course = {}
+
+        # -------- TITLE --------
+        title_tag = soup.find("h1") or soup.find("h2") or soup.title
+        if title_tag:
+            course["title"] = title_tag.get_text(strip=True)
+
+        # -------- IMAGE (fixed: PERFECT extraction) --------
+        # DiscUdemy always has Udemy thumbnails like:
+        # https://img-c.udemycdn.com/course/<size>/xxxx.jpg
+        img_url = None
+
+        for img in soup.find_all(["img", "amp-img"]):
+            src = img.get("src", "")
+            if "img-c.udemycdn.com" in src and "course" in src:
+                img_url = src
+                break
+
+        # fallback: look in meta tags
+        if not img_url:
+            og = soup.find("meta", property="og:image")
+            if og and og.get("content"):
+                if "udemycdn" in og["content"]:
+                    img_url = og["content"]
+
+        # final fallback: None
+        course["image_url"] = img_url
+
+        # -------- DESCRIPTION --------
+        desc = None
+        blocks = soup.find_all(["p", "div"], class_=re.compile(r"desc|summary|content"))
+        for b in blocks:
+            txt = b.get_text(strip=True)
+            if txt and len(txt) > 50:
+                desc = txt
+                break
+
+        course["description"] = desc
+
+        # -------- TAKE COURSE BUTTON --------
+        btn = soup.find("a", class_="discBtn")
+        if not btn or not btn.get("href"):
+            logger.error(f"No Take Course button at {detail_url}")
+            return None
+
+        go_link = btn["href"]
+        if go_link.startswith("/"):
+            go_link = urljoin(self.BASE, go_link)
+
+        # Try direct parameter extraction
+        parsed = urlparse(go_link)
+        params = parse_qs(parsed.query)
+
+        if "go" in params:
+            possible_url = params["go"][0]
+            if "udemy.com/course" in possible_url:
+                return self._finalize(possible_url, detail_url, go_link, course)
+
+        # Follow go link
+        try:
+            time.sleep(random.uniform(0.2, 0.5))
+            r2 = self.session.get(go_link, timeout=self.timeout)
+            r2.raise_for_status()
+        except:
+            return None
+
+        html = r2.text
+
+        # Direct udemy URLs
+        match = re.search(r"https://www\.udemy\.com/course/[^\"'>\s]+", html)
+        if match:
+            return self._finalize(match.group(0), detail_url, go_link, course)
+
+        logger.warning("No udemy link found")
+        return None
+
+    # --------------------------------------------------------
+    # Build output dictionary
+    # --------------------------------------------------------
+    def _finalize(self, udemy_url, detail_url, go_link, course):
         parsed = urlparse(udemy_url)
-        q = parse_qs(parsed.query)
-        code = q.get("couponCode", [""])[0]
+        parts = parsed.path.strip("/").split("/")
 
         slug = None
-        parts = parsed.path.strip("/").split("/")
         if "course" in parts:
-            i = parts.index("course")
-            if i + 1 < len(parts):
-                slug = parts[i + 1]
-        if not slug:
+            slug = parts[parts.index("course") + 1]
+        else:
             slug = parts[-1]
+
+        qs = parse_qs(parsed.query)
+        code = qs.get("couponCode", [""])[0]
 
         if not slug:
             return None
 
-        item = {
+        course.update({
             "detail_url": detail_url,
             "go_link": go_link,
             "udemy_url": udemy_url,
             "slug": slug,
             "coupon_code": code if code else "FREE",
-            "is_free": (code == ""),
-            "title": title or slug.replace("-", " ").title(),
-            "description": desc or ("Learn " + slug.replace("-", " ").title()),
-            "image_url": img
-        }
-        if code:
-            logger.info(f"Coupon course → {slug} | {code}")
-        else:
-            logger.info(f"Free course → {slug}")
-        return item
+            "is_free": not bool(code),
+        })
 
-    # -------------------------------------------------------
-    # Main scrape (page 1 only)
-    # -------------------------------------------------------
+        if not course.get("description"):
+            course["description"] = f"Learn {slug.replace('-', ' ').title()}!"
+
+        if not course.get("title"):
+            course["title"] = slug.replace("-", " ").title()
+
+        return course
+
+    # --------------------------------------------------------
+    # MAIN SCRAPER
+    # --------------------------------------------------------
     def scrape(self, max_pages=1):
-        all_items = []
+        results = []
 
         for page in range(1, max_pages + 1):
-            logger.info(f"Processing page {page}/{max_pages}")
             detail_urls = self.get_detail_urls(page)
-            if not detail_urls:
-                continue
+            for u in detail_urls:
+                item = self.extract_coupon(u)
+                if item:
+                    results.append(item)
+                time.sleep(random.uniform(0.2, 0.5))
 
-            for idx, durl in enumerate(detail_urls):
-                logger.info(f"Course {idx+1}/{len(detail_urls)}")
-                info = self.extract_coupon(durl)
-                if info:
-                    all_items.append(info)
+            if page < max_pages:
+                time.sleep(random.uniform(1, 2))
 
-                # tiny pause to avoid blocking; safe for render
-                time.sleep(random.uniform(0.25, 0.6))
-
-        logger.info(f"Scrape complete. {len(all_items)} courses total.")
-        return all_items
+        return results
